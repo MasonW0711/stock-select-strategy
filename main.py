@@ -18,7 +18,7 @@ from config import (
     ScreenParameters,
 )
 from screener import StockScreener, build_output_frames
-from utils import setup_logging
+from utils import setup_logging, parse_tdcc_or_twse_date
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -36,6 +36,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_SETTINGS.cache_dir, help="指定快取資料夾路徑")
     parser.add_argument("--log-level", type=str, default="INFO", help="logging level，例如 INFO 或 DEBUG")
     parser.add_argument("--output", type=str, default="", help="指定輸出的 xlsx 檔名")
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="回測起始日期（選填，格式 YYYYMMDD 或 YYYY-MM-DD）",
+    )
     return parser
 
 
@@ -100,6 +106,7 @@ def execute_screening(
     stock_limit: int | None,
     markets: tuple[str, ...],
     cache_settings: CacheSettings,
+    start_date: date | None = None,
 ) -> tuple[list[object], object, dict[str, pd.DataFrame]]:
     """執行一次完整篩選並回傳結果、摘要與輸出 frames。"""
 
@@ -109,7 +116,7 @@ def execute_screening(
         cache_settings=cache_settings,
         markets=markets,
     )
-    results, summary = screener.run_screening(stock_limit=stock_limit, markets=markets)
+    results, summary = screener.run_screening(stock_limit=stock_limit, markets=markets, start_date=start_date)
     frames = build_output_frames(results=results, summary=summary)
     return results, summary, frames
 
@@ -128,6 +135,14 @@ def build_summary_text(summary: object) -> list[str]:
     """將執行摘要整理成終端機可讀文字。"""
 
     market_counts = "、".join(f"{market}:{count}" for market, count in summary.market_counts.items()) if getattr(summary, "market_counts", None) else "無"
+    # 回測起始日：取 target_tdcc_dates 最早的日期（若有）
+    start_date_str = ""
+    if getattr(summary, "target_tdcc_dates", None):
+        try:
+            start_date_str = summary.target_tdcc_dates[-1].isoformat()
+        except Exception:
+            start_date_str = ""
+
     return [
         f"執行時間：{summary.run_timestamp.strftime('%Y-%m-%d %H:%M:%S')}",
         f"市場股票總數：{summary.total_universe}",
@@ -141,6 +156,7 @@ def build_summary_text(summary: object) -> list[str]:
         f"失敗檔數：{summary.failed_count}",
         f"最新 TDCC 日期：{summary.latest_tdcc_date.isoformat() if summary.latest_tdcc_date else ''}",
         f"TDCC 觀察日期：{', '.join(value.isoformat() for value in summary.target_tdcc_dates)}",
+        f"回測起始日：{start_date_str}",
         f"耗時秒數：{summary.elapsed_seconds:.2f}",
         f"警告：{'; '.join(summary.warnings) if summary.warnings else '無'}",
     ]
@@ -181,6 +197,7 @@ def main() -> int:
     screen_parameters = build_screen_parameters(args)
     markets = parse_markets(args.markets)
     cache_settings = build_cache_settings(args)
+    start_date = parse_tdcc_or_twse_date(args.start_date) if args.start_date else None
 
     _, summary, frames = execute_screening(
         screen_parameters=screen_parameters,
@@ -188,6 +205,7 @@ def main() -> int:
         stock_limit=args.stock_limit,
         markets=markets,
         cache_settings=cache_settings,
+        start_date=start_date,
     )
     print_terminal_output(frames=frames, summary_text=build_summary_text(summary))
 

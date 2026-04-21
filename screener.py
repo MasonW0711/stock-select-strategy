@@ -41,6 +41,7 @@ class StockScreener:
         self,
         stock_limit: int | None = None,
         markets: tuple[str, ...] = ("listed",),
+        start_date: date | None = None,
     ) -> tuple[list[StockScreenResult], ScreenRunSummary]:
         """執行完整選股流程並回傳結果與摘要。"""
 
@@ -51,8 +52,10 @@ class StockScreener:
             raise RuntimeError("TDCC 最新快照沒有可用日期")
 
         available_tdcc_dates = self.tdcc_history_client.get_available_dates()
-        target_tdcc_dates = self._resolve_target_tdcc_dates(available_tdcc_dates, latest_tdcc_date)
         warnings: list[str] = []
+        target_tdcc_dates = self._resolve_target_tdcc_dates(
+            available_tdcc_dates, latest_tdcc_date, start_date=start_date, warnings=warnings
+        )
         if len(target_tdcc_dates) < self.screen_params.min_history_weeks:
             warnings.append("TDCC 可用週數少於最低需求，結果可能不完整。")
 
@@ -124,13 +127,40 @@ class StockScreener:
             resolved[group_key] = sorted(bucket_ids)
         return resolved
 
-    def _resolve_target_tdcc_dates(self, available_dates: list[date], latest_tdcc_date: date) -> list[date]:
-        """依最新日期與可選日期列表決定本次要追的週數。"""
+    def _resolve_target_tdcc_dates(
+        self,
+        available_dates: list[date],
+        latest_tdcc_date: date,
+        start_date: date | None = None,
+        warnings: list[str] | None = None,
+    ) -> list[date]:
+        """依 anchor 日期（預設為 latest_tdcc_date 或使用者指定的 start_date）與可選日期列表決定本次要追的週數。
+
+        若使用者提供 `start_date`，會以該日期為錨點向回選取最近 N 週；若 `start_date` 晚於最新 TDCC，會回退使用 latest_tdcc_date 並加入 warning（若提供 warnings list）。
+        """
 
         required_weeks = max(self.screen_params.consecutive_weeks, self.screen_params.min_history_weeks)
-        ordered_dates = sorted({value for value in available_dates if value <= latest_tdcc_date}, reverse=True)
-        if latest_tdcc_date not in ordered_dates:
+        # 決定 anchor（以 start_date 為優先，但不超過 latest_tdcc_date）
+        anchor = latest_tdcc_date
+        if start_date is not None:
+            if start_date > latest_tdcc_date:
+                if warnings is not None:
+                    warnings.append("指定回測起始日晚於最新 TDCC，使用最新 TDCC 日期作為 anchor。")
+                anchor = latest_tdcc_date
+            else:
+                anchor = start_date
+
+        ordered_dates = sorted({value for value in available_dates if value <= anchor}, reverse=True)
+        # 若沒有可用的日期（例如 start_date 早於所有可用日期），退回到可用清單並提示
+        if not ordered_dates:
+            if warnings is not None:
+                warnings.append("指定回測起始日早於可用 TDCC 最早日期，改為使用可用日期列表。")
+            ordered_dates = sorted(available_dates, reverse=True)
+
+        # 若沒有指定 start_date，保留原行為：確保 latest_tdcc_date 在序列中
+        if start_date is None and latest_tdcc_date not in ordered_dates:
             ordered_dates.insert(0, latest_tdcc_date)
+
         return ordered_dates[:required_weeks]
 
     def _screen_single_stock(

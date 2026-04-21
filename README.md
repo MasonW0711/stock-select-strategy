@@ -38,6 +38,48 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## 開發、測試與 CI
+
+### 本地開發（快速開始）
+
+1. 建議在乾淨的虛擬環境中執行：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. 執行語法檢查與測試：
+
+```bash
+# 安裝測試工具
+pip install -U pytest
+
+# 只檢查語法（不執行外部 API）
+python -m py_compile $(find . -name '*.py' -not -path './.venv/*' -not -path './venv/*' -not -path './.git/*' -not -path './.github/*')
+
+# 執行 repository 的基本測試
+pytest -q
+```
+
+### GitHub Actions CI
+
+已新增 GitHub Actions 工作流程 `.github/workflows/ci.yml`，內容會在 push / pull_request 上執行：
+
+- 以 Ubuntu 最新映像建立 Python (3.10、3.11) 環境
+- 安裝 `requirements.txt`（若存在）與 `pytest`
+- 執行語法檢查（`py_compile`）
+- 執行 `pytest`
+
+工作流程位置：`.github/workflows/ci.yml`
+
+若要在 README 上顯示 badge，可使用：
+
+```
+![CI](https://github.com/MasonW0711/stock-select-strategy/actions/workflows/ci.yml/badge.svg)
+```
+
 ## CLI 執行方式
 
 1. 直接跑全市場預設條件

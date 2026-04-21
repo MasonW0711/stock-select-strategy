@@ -6,7 +6,7 @@ import streamlit as st
 
 from config import DEFAULT_CACHE_SETTINGS, DEFAULT_MARKETS, DEFAULT_SCREEN_PARAMETERS, MARKET_LABELS, CacheSettings, ScreenParameters
 from main import build_summary_text, execute_screening, frames_to_excel_bytes, resolve_output_path
-from utils import setup_logging
+from utils import setup_logging, parse_tdcc_or_twse_date
 
 
 st.set_page_config(page_title="台股自動選股儀表板", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -163,6 +163,7 @@ with st.sidebar:
         max_distance_to_ma = st.slider("距離 20MA 上限", min_value=0.01, max_value=0.2, value=DEFAULT_SCREEN_PARAMETERS.max_distance_to_ma, step=0.01)
         min_price_days = st.slider("最低價格日數", min_value=20, max_value=120, value=DEFAULT_SCREEN_PARAMETERS.min_price_days, step=5)
         price_history_months = st.slider("回抓價格月份數", min_value=2, max_value=12, value=DEFAULT_SCREEN_PARAMETERS.price_history_months)
+        start_date_text = st.text_input("回測起始日期（選填，YYYYMMDD 或 YYYY-MM-DD）", value="")
         enable_cache = st.checkbox("啟用磁碟快取", value=True)
         log_level = st.selectbox("Log 等級", options=["INFO", "DEBUG"], index=0)
         submitted = st.form_submit_button("開始篩選", use_container_width=True)
@@ -184,12 +185,14 @@ if submitted:
         actual_stock_limit = int(stock_limit) if stock_limit_enabled else None
 
         with st.spinner("正在抓取資料並執行篩選，這可能需要一些時間..."):
+            start_date = parse_tdcc_or_twse_date(start_date_text) if start_date_text else None
             _, summary, frames = execute_screening(
                 screen_parameters=screen_parameters,
                 logger=logger,
                 stock_limit=actual_stock_limit,
                 markets=tuple(selected_markets),
                 cache_settings=cache_settings,
+                start_date=start_date,
             )
             excel_bytes = frames_to_excel_bytes(frames)
             output_path = resolve_output_path("")
