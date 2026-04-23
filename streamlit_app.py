@@ -4,9 +4,11 @@ from pathlib import Path
 
 import streamlit as st
 
+from datetime import date, timedelta
+
 from config import DEFAULT_CACHE_SETTINGS, DEFAULT_MARKETS, DEFAULT_SCREEN_PARAMETERS, MARKET_LABELS, CacheSettings, ScreenParameters
 from main import build_summary_text, execute_screening, frames_to_excel_bytes, resolve_output_path
-from utils import setup_logging, parse_tdcc_or_twse_date
+from utils import setup_logging, format_ratio_as_pct
 
 
 st.set_page_config(page_title="台股自動選股儀表板", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -163,7 +165,17 @@ with st.sidebar:
         max_distance_to_ma = st.slider("距離 20MA 上限", min_value=0.01, max_value=0.2, value=DEFAULT_SCREEN_PARAMETERS.max_distance_to_ma, step=0.01)
         min_price_days = st.slider("最低價格日數", min_value=20, max_value=120, value=DEFAULT_SCREEN_PARAMETERS.min_price_days, step=5)
         price_history_months = st.slider("回抓價格月份數", min_value=2, max_value=12, value=DEFAULT_SCREEN_PARAMETERS.price_history_months)
-        start_date_text = st.text_input("回測起始日期（選填，YYYYMMDD 或 YYYY-MM-DD）", value="")
+        st.markdown("---")
+        st.markdown("**回測驗證（選填）**")
+        st.caption("選擇一個過去的日期，以該日的籌碼資料篩選股票，並計算之後 1 個月、3 個月的漲跌幅，驗證選股策略是否有效。")
+        backtest_date = st.date_input(
+            "回測日期",
+            value=None,
+            min_value=date.today() - timedelta(days=365 * 3),
+            max_value=date.today() - timedelta(days=30),
+            format="YYYY-MM-DD",
+            help="選擇後以該日歷史資料執行篩選，並自動計算後續 30/90 天報酬率",
+        )
         enable_cache = st.checkbox("啟用磁碟快取", value=True)
         log_level = st.selectbox("Log 等級", options=["INFO", "DEBUG"], index=0)
         submitted = st.form_submit_button("開始篩選", use_container_width=True)
@@ -185,14 +197,13 @@ if submitted:
         actual_stock_limit = int(stock_limit) if stock_limit_enabled else None
 
         with st.spinner("正在抓取資料並執行篩選，這可能需要一些時間..."):
-            start_date = parse_tdcc_or_twse_date(start_date_text) if start_date_text else None
             _, summary, frames = execute_screening(
                 screen_parameters=screen_parameters,
                 logger=logger,
                 stock_limit=actual_stock_limit,
                 markets=tuple(selected_markets),
                 cache_settings=cache_settings,
-                start_date=start_date,
+                start_date=backtest_date,
             )
             excel_bytes = frames_to_excel_bytes(frames)
             output_path = resolve_output_path("")
@@ -234,12 +245,43 @@ if run_result:
     summary_lines = "".join(f"<li>{line}</li>" for line in build_summary_text(summary))
     st.markdown(f'<div class="summary-panel"><strong>執行摘要</strong><ul>{summary_lines}</ul></div>', unsafe_allow_html=True)
 
-    pass_tab, fail_tab, raw_tab = st.tabs(["通過清單", "未通過清單", "原始摘要"])
-    with pass_tab:
+    has_backtest = "backtest" in frames and not frames["backtest"].empty
+    tab_labels = ["通過清單", "未通過清單", "原始摘要"]
+    if has_backtest:
+        tab_labels.append("回測績效驗證")
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
         st.dataframe(frames["pass"], use_container_width=True, height=420)
-    with fail_tab:
+    with tabs[1]:
         st.dataframe(frames["fail"], use_container_width=True, height=420)
-    with raw_tab:
+    with tabs[2]:
         st.dataframe(frames["raw_data_summary"], use_container_width=True, height=520)
+
+    if has_backtest:
+        with tabs[3]:
+            bt_frame = frames["backtest"]
+            anchor_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else "?"
+            st.markdown(f"**篩選日期：{anchor_date_str}**　共 {len(bt_frame)} 檔通過篩選")
+            st.caption("⚠️ 本回測使用今日的股票清單，已下市或代號變更的股票可能無法抓到歷史資料。")
+
+            col1m, col3m, col1m_wr, col3m_wr = st.columns(4)
+            returns_1m = bt_frame["1個月後報酬率"].dropna()
+            returns_3m = bt_frame["3個月後報酬率"].dropna()
+            avg_1m = returns_1m.mean() if len(returns_1m) > 0 else None
+            avg_3m = returns_3m.mean() if len(returns_3m) > 0 else None
+            wr_1m = (returns_1m > 0).sum() / len(returns_1m) if len(returns_1m) > 0 else None
+            wr_3m = (returns_3m > 0).sum() / len(returns_3m) if len(returns_3m) > 0 else None
+
+            col1m.metric("1個月後平均報酬", format_ratio_as_pct(avg_1m) if avg_1m is not None else "N/A")
+            col3m.metric("3個月後平均報酬", format_ratio_as_pct(avg_3m) if avg_3m is not None else "N/A")
+            col1m_wr.metric("1個月後勝率", f"{wr_1m:.0%}" if wr_1m is not None else "N/A")
+            col3m_wr.metric("3個月後勝率", f"{wr_3m:.0%}" if wr_3m is not None else "N/A")
+
+            display_bt = bt_frame.copy()
+            display_bt["1個月後報酬"] = display_bt["1個月後報酬率"].apply(format_ratio_as_pct)
+            display_bt["3個月後報酬"] = display_bt["3個月後報酬率"].apply(format_ratio_as_pct)
+            display_bt = display_bt.drop(columns=["1個月後報酬率", "3個月後報酬率"])
+            st.dataframe(display_bt, use_container_width=True, height=420)
 else:
     st.info("在左側設定條件後按下「開始篩選」，即可產生 CLI 同步邏輯的結果與 Excel。")

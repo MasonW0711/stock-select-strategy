@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -67,12 +67,23 @@ class StockScreener:
         if missing_latest_tdcc > 0:
             warnings.append(f"有 {missing_latest_tdcc} 檔上市股票缺少最新 TDCC 快照。")
 
+        # 回測模式：以 target_tdcc_dates[0] 為錨點，動態計算需要抓多久的價格資料
+        effective_as_of_date: date | None = None
+        effective_price_months = self.screen_params.price_history_months
+        if start_date is not None and target_tdcc_dates:
+            effective_as_of_date = target_tdcc_dates[0]
+            today = date.today()
+            months_since_anchor = (today.year - effective_as_of_date.year) * 12 + (today.month - effective_as_of_date.month) + 1
+            effective_price_months = max(self.screen_params.price_history_months, min(months_since_anchor + 4, 24))
+
         results: list[StockScreenResult] = []
         for index, stock_code in enumerate(universe_codes, start=1):
             result = self._screen_single_stock(
                 stock_info=listed_stocks[stock_code],
                 latest_snapshot=latest_snapshots[stock_code],
                 target_tdcc_dates=target_tdcc_dates,
+                as_of_date=effective_as_of_date,
+                effective_price_months=effective_price_months,
             )
             results.append(result)
             if index % 50 == 0 or index == len(universe_codes):
@@ -87,6 +98,7 @@ class StockScreener:
             skipped_count=(len(listed_stocks) - len(universe_codes)),
             warnings=warnings,
             elapsed_seconds=time.perf_counter() - started_at,
+            backtest_anchor_date=effective_as_of_date,
         )
         return results, summary
 
@@ -168,6 +180,8 @@ class StockScreener:
         stock_info: StockInfo,
         latest_snapshot: ShareholdingSnapshot,
         target_tdcc_dates: list[date],
+        as_of_date: date | None = None,
+        effective_price_months: int | None = None,
     ) -> StockScreenResult:
         """執行單一股票的籌碼與價格篩選。"""
 
@@ -216,13 +230,17 @@ class StockScreener:
             result.passed = False
             return result
 
+        price_months = effective_price_months if effective_price_months is not None else self.screen_params.price_history_months
         price_client = self._resolve_price_client(stock_info.market)
         price_bars = price_client.fetch_stock_day_history(
             stock_code=stock_info.code,
-            months=self.screen_params.price_history_months,
+            months=price_months,
         )
         result.price_days_loaded = len(price_bars)
-        self._apply_price_filters(price_bars=price_bars, result=result)
+        self._apply_price_filters(price_bars=price_bars, result=result, as_of_date=as_of_date)
+        # 回測模式：計算篩選日後的遠期報酬率（僅針對通過籌碼條件的股票）
+        if as_of_date is not None and result.passed_shareholding:
+            result.forward_returns = self._compute_forward_returns(price_bars=price_bars, anchor_date=as_of_date)
         result.passed = result.passed_shareholding and result.passed_price and len(result.fail_reasons) == 0
         return result
 
@@ -290,10 +308,12 @@ class StockScreener:
             return all(normalized[index] > normalized[index + 1] for index in range(len(normalized) - 1))
         return all(normalized[index] < normalized[index + 1] for index in range(len(normalized) - 1))
 
-    def _apply_price_filters(self, price_bars: list[PriceBar], result: StockScreenResult) -> None:
-        """計算價格指標並套用近三個月漲幅與月線距離條件。"""
+    def _apply_price_filters(self, price_bars: list[PriceBar], result: StockScreenResult, as_of_date: date | None = None) -> None:
+        """計算價格指標並套用近三個月漲幅與月線距離條件。回測模式下只使用 as_of_date 當天或之前的資料。"""
 
-        valid_bars = [bar for bar in price_bars if bar.close_price is not None]
+        fail_count_before = len(result.fail_reasons)
+        bars_for_screen = [bar for bar in price_bars if as_of_date is None or bar.trade_date <= as_of_date]
+        valid_bars = [bar for bar in bars_for_screen if bar.close_price is not None]
         if len(valid_bars) < self.screen_params.min_price_days:
             result.fail_reasons.append("價格資料不足")
             result.passed_price = False
@@ -335,7 +355,38 @@ class StockScreener:
         elif result.distance_to_ma20 > self.screen_params.max_distance_to_ma:
             result.fail_reasons.append("股價距月線過遠")
 
-        result.passed_price = len([reason for reason in result.fail_reasons if "價格" in reason or "20MA" in reason or "月線" in reason or "漲幅" in reason]) == 0
+        result.passed_price = len(result.fail_reasons) == fail_count_before
+
+    def _compute_forward_returns(
+        self,
+        price_bars: list[PriceBar],
+        anchor_date: date,
+        windows_days: tuple[int, ...] = (30, 90),
+    ) -> dict[int, float | None]:
+        """計算從 anchor_date 起 N 日後的報酬率，用於回測策略驗證。"""
+
+        valid_bars = [bar for bar in price_bars if bar.close_price is not None]
+        if not valid_bars:
+            return {w: None for w in windows_days}
+
+        # 錨點價格：anchor_date 當天或其後最近一個有收盤價的交易日
+        anchor_bars = [bar for bar in valid_bars if bar.trade_date >= anchor_date]
+        if not anchor_bars:
+            return {w: None for w in windows_days}
+        anchor_price = anchor_bars[0].close_price
+        if not anchor_price:
+            return {w: None for w in windows_days}
+
+        result: dict[int, float | None] = {}
+        for days in windows_days:
+            target_date = anchor_date + timedelta(days=days)
+            future_bars = [bar for bar in valid_bars if bar.trade_date >= target_date]
+            if not future_bars:
+                result[days] = None
+            else:
+                future_price = future_bars[0].close_price
+                result[days] = (future_price / anchor_price - 1) if future_price else None
+        return result
 
     def _build_run_summary(
         self,
@@ -347,6 +398,7 @@ class StockScreener:
         skipped_count: int,
         warnings: list[str],
         elapsed_seconds: float,
+        backtest_anchor_date: date | None = None,
     ) -> ScreenRunSummary:
         """彙整整次篩選執行的摘要資訊。"""
 
@@ -369,6 +421,7 @@ class StockScreener:
             elapsed_seconds=elapsed_seconds,
             failure_category_counts=dict(failure_counter),
             warnings=warnings,
+            backtest_anchor_date=backtest_anchor_date,
         )
 
     def _categorize_failure(self, fail_reasons: list[str]) -> str:
@@ -412,7 +465,12 @@ def build_output_frames(results: list[StockScreenResult], summary: ScreenRunSumm
 
     pass_frame = display_frame[display_frame["是否通過篩選"] == "Y"].reset_index(drop=True) if not display_frame.empty else pd.DataFrame(columns=_display_columns())
     fail_frame = display_frame[display_frame["是否通過篩選"] == "N"].reset_index(drop=True) if not display_frame.empty else pd.DataFrame(columns=_display_columns())
-    return {"pass": pass_frame, "fail": fail_frame, "raw_data_summary": raw_frame}
+    frames: dict[str, pd.DataFrame] = {"pass": pass_frame, "fail": fail_frame, "raw_data_summary": raw_frame}
+    # 若有回測遠期報酬資料，加入 backtest frame（只包含通過的股票，含數值報酬率）
+    if any(result.forward_returns for result in results):
+        backtest_rows = [_build_backtest_row(result) for result in results if result.passed]
+        frames["backtest"] = pd.DataFrame(backtest_rows) if backtest_rows else pd.DataFrame(columns=["股票代號", "股票名稱", "篩選日收盤價", "1個月後報酬率", "3個月後報酬率"])
+    return frames
 
 
 def _build_display_row(result: StockScreenResult) -> dict[str, Any]:
@@ -430,6 +488,8 @@ def _build_display_row(result: StockScreenResult) -> dict[str, Any]:
         "大於1000張人數最近N週趨勢": format_trend_values(result.large_holder_trend),
         "是否通過篩選": "Y" if result.passed else "N",
         "不通過原因": "；".join(result.fail_reasons),
+        "1個月後報酬": format_ratio_as_pct(result.forward_returns.get(30)),
+        "3個月後報酬": format_ratio_as_pct(result.forward_returns.get(90)),
     }
 
 
@@ -456,6 +516,19 @@ def _build_raw_summary_row(result: StockScreenResult) -> dict[str, Any]:
     }
 
 
+def _build_backtest_row(result: StockScreenResult) -> dict[str, Any]:
+    """將通過篩選的結果轉成回測績效驗證列（含數值報酬率，供統計計算）。"""
+
+    return {
+        "股票代號": result.code,
+        "股票名稱": result.name,
+        "市場": result.market,
+        "篩選日收盤價": result.latest_close,
+        "篩選日期": result.latest_price_date.isoformat() if result.latest_price_date else "",
+        "1個月後報酬率": result.forward_returns.get(30),
+        "3個月後報酬率": result.forward_returns.get(90),
+    }
+
 def _display_columns() -> list[str]:
     """回傳終端機顯示欄位的固定順序。"""
 
@@ -471,4 +544,6 @@ def _display_columns() -> list[str]:
         "大於1000張人數最近N週趨勢",
         "是否通過篩選",
         "不通過原因",
+        "1個月後報酬",
+        "3個月後報酬",
     ]

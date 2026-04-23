@@ -135,13 +135,7 @@ def build_summary_text(summary: object) -> list[str]:
     """將執行摘要整理成終端機可讀文字。"""
 
     market_counts = "、".join(f"{market}:{count}" for market, count in summary.market_counts.items()) if getattr(summary, "market_counts", None) else "無"
-    # 回測起始日：取 target_tdcc_dates 最早的日期（若有）
-    start_date_str = ""
-    if getattr(summary, "target_tdcc_dates", None):
-        try:
-            start_date_str = summary.target_tdcc_dates[-1].isoformat()
-        except Exception:
-            start_date_str = ""
+    start_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else ""
 
     return [
         f"執行時間：{summary.run_timestamp.strftime('%Y-%m-%d %H:%M:%S')}",

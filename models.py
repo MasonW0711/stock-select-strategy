@@ -83,6 +83,7 @@ class StockScreenResult:
     passed: bool = False
     fail_reasons: list[str] = field(default_factory=list)
     source_notes: list[str] = field(default_factory=list)
+    forward_returns: dict[int, float | None] = field(default_factory=dict)
 
     def primary_fail_reason(self) -> str:
         """回傳最主要的失敗原因。"""
@@ -107,3 +108,4 @@ class ScreenRunSummary:
     elapsed_seconds: float = 0.0
     failure_category_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    backtest_anchor_date: date | None = None
