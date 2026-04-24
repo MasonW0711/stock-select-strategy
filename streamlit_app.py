@@ -6,6 +6,7 @@ import streamlit as st
 
 from datetime import date, timedelta
 
+from api_clients import ApiClientError
 from config import DEFAULT_CACHE_SETTINGS, DEFAULT_MARKETS, DEFAULT_SCREEN_PARAMETERS, MARKET_LABELS, CacheSettings, ScreenParameters
 from main import build_summary_text, execute_screening, frames_to_excel_bytes, resolve_output_path
 from utils import setup_logging, format_ratio_as_pct
@@ -196,26 +197,31 @@ if submitted:
         cache_settings = _build_cache_settings(enable_cache)
         actual_stock_limit = int(stock_limit) if stock_limit_enabled else None
 
-        with st.spinner("正在抓取資料並執行篩選，這可能需要一些時間..."):
-            _, summary, frames = execute_screening(
-                screen_parameters=screen_parameters,
-                logger=logger,
-                stock_limit=actual_stock_limit,
-                markets=tuple(selected_markets),
-                cache_settings=cache_settings,
-                start_date=backtest_date,
-            )
-            excel_bytes = frames_to_excel_bytes(frames)
-            output_path = resolve_output_path("")
-            output_path.write_bytes(excel_bytes)
-
-        st.session_state["screening_run"] = {
-            "summary": summary,
-            "frames": frames,
-            "excel_bytes": excel_bytes,
-            "output_path": str(output_path),
-            "download_name": output_path.name,
-        }
+        try:
+            with st.spinner("正在抓取資料並執行篩選，這可能需要一些時間..."):
+                _, summary, frames = execute_screening(
+                    screen_parameters=screen_parameters,
+                    logger=logger,
+                    stock_limit=actual_stock_limit,
+                    markets=tuple(selected_markets),
+                    cache_settings=cache_settings,
+                    start_date=backtest_date,
+                )
+                excel_bytes = frames_to_excel_bytes(frames)
+                output_path = resolve_output_path("")
+                output_path.write_bytes(excel_bytes)
+        except ApiClientError as exc:
+            st.session_state.pop("screening_run", None)
+            st.error(f"官方資料來源暫時回應異常：{exc}")
+            st.info("系統已避免整頁直接崩潰。你可以稍後重試，或先限制股票數量縮小範圍。")
+        else:
+            st.session_state["screening_run"] = {
+                "summary": summary,
+                "frames": frames,
+                "excel_bytes": excel_bytes,
+                "output_path": str(output_path),
+                "download_name": output_path.name,
+            }
 
 
 run_result = st.session_state.get("screening_run")
@@ -245,7 +251,7 @@ if run_result:
     summary_lines = "".join(f"<li>{line}</li>" for line in build_summary_text(summary))
     st.markdown(f'<div class="summary-panel"><strong>執行摘要</strong><ul>{summary_lines}</ul></div>', unsafe_allow_html=True)
 
-    has_backtest = "backtest" in frames and not frames["backtest"].empty
+    has_backtest = getattr(summary, "backtest_anchor_date", None) is not None
     tab_labels = ["通過清單", "未通過清單", "原始摘要"]
     if has_backtest:
         tab_labels.append("回測績效驗證")
@@ -265,23 +271,26 @@ if run_result:
             st.markdown(f"**篩選日期：{anchor_date_str}**　共 {len(bt_frame)} 檔通過篩選")
             st.caption("⚠️ 本回測使用今日的股票清單，已下市或代號變更的股票可能無法抓到歷史資料。")
 
-            col1m, col3m, col1m_wr, col3m_wr = st.columns(4)
-            returns_1m = bt_frame["1個月後報酬率"].dropna()
-            returns_3m = bt_frame["3個月後報酬率"].dropna()
-            avg_1m = returns_1m.mean() if len(returns_1m) > 0 else None
-            avg_3m = returns_3m.mean() if len(returns_3m) > 0 else None
-            wr_1m = (returns_1m > 0).sum() / len(returns_1m) if len(returns_1m) > 0 else None
-            wr_3m = (returns_3m > 0).sum() / len(returns_3m) if len(returns_3m) > 0 else None
+            if bt_frame.empty:
+                st.info("這個回測日期目前沒有符合條件的股票，或價格資料不足，因此暫無可計算的後續報酬。")
+            else:
+                col1m, col3m, col1m_wr, col3m_wr = st.columns(4)
+                returns_1m = bt_frame["1個月後報酬率"].dropna()
+                returns_3m = bt_frame["3個月後報酬率"].dropna()
+                avg_1m = returns_1m.mean() if len(returns_1m) > 0 else None
+                avg_3m = returns_3m.mean() if len(returns_3m) > 0 else None
+                wr_1m = (returns_1m > 0).sum() / len(returns_1m) if len(returns_1m) > 0 else None
+                wr_3m = (returns_3m > 0).sum() / len(returns_3m) if len(returns_3m) > 0 else None
 
-            col1m.metric("1個月後平均報酬", format_ratio_as_pct(avg_1m) if avg_1m is not None else "N/A")
-            col3m.metric("3個月後平均報酬", format_ratio_as_pct(avg_3m) if avg_3m is not None else "N/A")
-            col1m_wr.metric("1個月後勝率", f"{wr_1m:.0%}" if wr_1m is not None else "N/A")
-            col3m_wr.metric("3個月後勝率", f"{wr_3m:.0%}" if wr_3m is not None else "N/A")
+                col1m.metric("1個月後平均報酬", format_ratio_as_pct(avg_1m) if avg_1m is not None else "N/A")
+                col3m.metric("3個月後平均報酬", format_ratio_as_pct(avg_3m) if avg_3m is not None else "N/A")
+                col1m_wr.metric("1個月後勝率", f"{wr_1m:.0%}" if wr_1m is not None else "N/A")
+                col3m_wr.metric("3個月後勝率", f"{wr_3m:.0%}" if wr_3m is not None else "N/A")
 
-            display_bt = bt_frame.copy()
-            display_bt["1個月後報酬"] = display_bt["1個月後報酬率"].apply(format_ratio_as_pct)
-            display_bt["3個月後報酬"] = display_bt["3個月後報酬率"].apply(format_ratio_as_pct)
-            display_bt = display_bt.drop(columns=["1個月後報酬率", "3個月後報酬率"])
-            st.dataframe(display_bt, use_container_width=True, height=420)
+                display_bt = bt_frame.copy()
+                display_bt["1個月後報酬"] = display_bt["1個月後報酬率"].apply(format_ratio_as_pct)
+                display_bt["3個月後報酬"] = display_bt["3個月後報酬率"].apply(format_ratio_as_pct)
+                display_bt = display_bt.drop(columns=["1個月後報酬率", "3個月後報酬率"])
+                st.dataframe(display_bt, use_container_width=True, height=420)
 else:
     st.info("在左側設定條件後按下「開始篩選」，即可產生 CLI 同步邏輯的結果與 Excel。")

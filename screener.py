@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from api_clients import DataNotFoundError, TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
+from api_clients import ApiClientError, DataNotFoundError, TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
 from config import ScreenParameters, TDCC_BUCKET_DEFINITIONS, TDCC_HOLDER_GROUPS
 from models import PriceBar, ScreenRunSummary, ShareholdingSnapshot, StockInfo, StockScreenResult
 from utils import format_ratio_as_pct, format_trend_values
@@ -232,10 +232,18 @@ class StockScreener:
 
         price_months = effective_price_months if effective_price_months is not None else self.screen_params.price_history_months
         price_client = self._resolve_price_client(stock_info.market)
-        price_bars = price_client.fetch_stock_day_history(
-            stock_code=stock_info.code,
-            months=price_months,
-        )
+        try:
+            price_bars = price_client.fetch_stock_day_history(
+                stock_code=stock_info.code,
+                months=price_months,
+            )
+        except ApiClientError as exc:
+            self.logger.warning("價格資料抓取失敗：%s (%s)", stock_info.code, exc)
+            result.fail_reasons.append("價格資料抓取失敗")
+            result.source_notes.append(str(exc))
+            result.passed_price = False
+            result.passed = False
+            return result
         result.price_days_loaded = len(price_bars)
         self._apply_price_filters(price_bars=price_bars, result=result, as_of_date=as_of_date)
         # 回測模式：計算篩選日後的遠期報酬率（僅針對通過籌碼條件的股票）
@@ -466,10 +474,10 @@ def build_output_frames(results: list[StockScreenResult], summary: ScreenRunSumm
     pass_frame = display_frame[display_frame["是否通過篩選"] == "Y"].reset_index(drop=True) if not display_frame.empty else pd.DataFrame(columns=_display_columns())
     fail_frame = display_frame[display_frame["是否通過篩選"] == "N"].reset_index(drop=True) if not display_frame.empty else pd.DataFrame(columns=_display_columns())
     frames: dict[str, pd.DataFrame] = {"pass": pass_frame, "fail": fail_frame, "raw_data_summary": raw_frame}
-    # 若有回測遠期報酬資料，加入 backtest frame（只包含通過的股票，含數值報酬率）
-    if any(result.forward_returns for result in results):
+    if summary.backtest_anchor_date is not None:
+        backtest_columns = ["股票代號", "股票名稱", "市場", "篩選日收盤價", "篩選日期", "1個月後報酬率", "3個月後報酬率"]
         backtest_rows = [_build_backtest_row(result) for result in results if result.passed]
-        frames["backtest"] = pd.DataFrame(backtest_rows) if backtest_rows else pd.DataFrame(columns=["股票代號", "股票名稱", "篩選日收盤價", "1個月後報酬率", "3個月後報酬率"])
+        frames["backtest"] = pd.DataFrame(backtest_rows, columns=backtest_columns)
     return frames
 
 

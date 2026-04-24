@@ -1,10 +1,10 @@
-from datetime import date
+from datetime import date, datetime
 
-import pytest
-
+from api_clients import ApiClientError, TWSEApiClient
+from config import DEFAULT_CACHE_SETTINGS, DEFAULT_HTTP_SETTINGS, DEFAULT_SCREEN_PARAMETERS
 from config import DEFAULT_SCREEN_PARAMETERS
-from models import PriceBar, StockScreenResult
-from screener import StockScreener
+from models import PriceBar, ScreenRunSummary, StockScreenResult
+from screener import StockScreener, build_output_frames
 
 
 def _make_screener():
@@ -167,3 +167,44 @@ def test_apply_price_filters_passed_price_correctness():
     screener._apply_price_filters(few_bars, result)
     assert result.passed_price is False
     assert any("價格資料不足" in r for r in result.fail_reasons)
+
+
+def test_build_output_frames_creates_empty_backtest_frame_when_requested():
+    summary = ScreenRunSummary(
+        run_timestamp=datetime(2026, 4, 24, 9, 0, 0),
+        total_universe=0,
+        latest_tdcc_date=None,
+        target_tdcc_dates=[],
+        backtest_anchor_date=date(2025, 10, 1),
+    )
+
+    frames = build_output_frames([], summary)
+
+    assert "backtest" in frames
+    assert frames["backtest"].empty
+    assert list(frames["backtest"].columns) == [
+        "股票代號",
+        "股票名稱",
+        "市場",
+        "篩選日收盤價",
+        "篩選日期",
+        "1個月後報酬率",
+        "3個月後報酬率",
+    ]
+
+
+class _AlwaysFailTWSEClient(TWSEApiClient):
+    def get_json(self, url: str, **kwargs):
+        raise ApiClientError("bad json payload")
+
+
+def test_twse_fetch_stock_day_history_skips_months_on_api_client_error():
+    client = _AlwaysFailTWSEClient(
+        http_settings=DEFAULT_HTTP_SETTINGS,
+        cache_settings=DEFAULT_CACHE_SETTINGS,
+        logger=None,
+    )
+
+    bars = client.fetch_stock_day_history("2330", months=1)
+
+    assert bars == []

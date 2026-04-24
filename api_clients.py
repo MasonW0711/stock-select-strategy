@@ -141,10 +141,11 @@ class BaseHttpClient:
         cache_namespace = kwargs.pop("cache_namespace", None)
         cache_key = kwargs.pop("cache_key", None)
         cache_max_age_seconds = kwargs.pop("cache_max_age_seconds", None)
+        resolved_cache_key = cache_key or self._build_cache_key(url=url, kwargs=kwargs)
         if cache_namespace:
             cached_text = self._load_cache_text(
                 namespace=cache_namespace,
-                cache_key=cache_key or self._build_cache_key(url=url, kwargs=kwargs),
+                cache_key=resolved_cache_key,
                 max_age_seconds=cache_max_age_seconds,
             )
             if cached_text is not None:
@@ -154,16 +155,21 @@ class BaseHttpClient:
                     pass
 
         response = self.request("GET", url, **kwargs)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            content_type = normalize_text(response.headers.get("Content-Type")) or "unknown"
+            preview = normalize_text(response.text).replace("\n", " ")[:180] or "<empty>"
+            self.logger.warning("JSON 解析失敗：%s content-type=%s preview=%s", url, content_type, preview)
+            raise ApiClientError(f"JSON 解析失敗：{url} (content-type={content_type})") from exc
+
         if cache_namespace:
             self._save_cache_text(
                 namespace=cache_namespace,
-                cache_key=cache_key or self._build_cache_key(url=url, kwargs=kwargs),
+                cache_key=resolved_cache_key,
                 text=response.text,
             )
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise ApiClientError(f"JSON 解析失敗：{url}") from exc
+        return payload
 
     def get_text(self, url: str, **kwargs: Any) -> str:
         """執行 GET 並回傳文字內容。"""
@@ -568,17 +574,21 @@ class TWSEApiClient(BaseHttpClient):
         month_starts = iter_recent_month_starts(anchor_date=date.today(), months=months)
 
         for month_start in month_starts:
-            payload = self.get_json(
-                TWSE_STOCK_DAY_URL,
-                params={
-                    "date": month_start.strftime("%Y%m01"),
-                    "stockNo": stock_code,
-                    "response": "json",
-                },
-                cache_namespace="twse_price",
-                cache_key=f"{stock_code}_{month_start:%Y%m}",
-                cache_max_age_seconds=self.cache_settings.price_ttl_seconds,
-            )
+            try:
+                payload = self.get_json(
+                    TWSE_STOCK_DAY_URL,
+                    params={
+                        "date": month_start.strftime("%Y%m01"),
+                        "stockNo": stock_code,
+                        "response": "json",
+                    },
+                    cache_namespace="twse_price",
+                    cache_key=f"{stock_code}_{month_start:%Y%m}",
+                    cache_max_age_seconds=self.cache_settings.price_ttl_seconds,
+                )
+            except ApiClientError as exc:
+                self.logger.warning("TWSE 月資料抓取失敗：%s %s (%s)", stock_code, month_start.strftime("%Y-%m"), exc)
+                continue
             if not isinstance(payload, dict):
                 continue
             if normalize_text(payload.get("stat")) != "OK":
@@ -668,16 +678,20 @@ class TPEXApiClient(BaseHttpClient):
         month_starts = iter_recent_month_starts(anchor_date=date.today(), months=months)
 
         for month_start in month_starts:
-            payload = self.get_json(
-                TPEX_OTC_STOCK_DAY_URL,
-                params={
-                    "code": stock_code,
-                    "date": month_start.strftime("%Y/%m/01"),
-                },
-                cache_namespace="tpex_price",
-                cache_key=f"{stock_code}_{month_start:%Y%m}",
-                cache_max_age_seconds=self.cache_settings.price_ttl_seconds,
-            )
+            try:
+                payload = self.get_json(
+                    TPEX_OTC_STOCK_DAY_URL,
+                    params={
+                        "code": stock_code,
+                        "date": month_start.strftime("%Y/%m/01"),
+                    },
+                    cache_namespace="tpex_price",
+                    cache_key=f"{stock_code}_{month_start:%Y%m}",
+                    cache_max_age_seconds=self.cache_settings.price_ttl_seconds,
+                )
+            except ApiClientError as exc:
+                self.logger.warning("TPEX 月資料抓取失敗：%s %s (%s)", stock_code, month_start.strftime("%Y-%m"), exc)
+                continue
             if not isinstance(payload, dict) or normalize_text(payload.get("stat")).lower() != "ok":
                 self.logger.warning("TPEX 月資料無法取得：%s %s", stock_code, month_start.strftime("%Y-%m"))
                 continue
