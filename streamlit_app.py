@@ -149,6 +149,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.info("回測功能在左側欄。先勾選「啟用回測驗證」，再選日期，最後按「開始回測驗證」。")
+
 
 with st.sidebar:
     st.subheader("執行設定")
@@ -167,19 +169,24 @@ with st.sidebar:
         min_price_days = st.slider("最低價格日數", min_value=20, max_value=120, value=DEFAULT_SCREEN_PARAMETERS.min_price_days, step=5)
         price_history_months = st.slider("回抓價格月份數", min_value=2, max_value=12, value=DEFAULT_SCREEN_PARAMETERS.price_history_months)
         st.markdown("---")
-        st.markdown("**回測驗證（選填）**")
-        st.caption("選擇一個過去的日期，以該日的籌碼資料篩選股票，並計算之後 1 個月、3 個月的漲跌幅，驗證選股策略是否有效。")
-        backtest_date = st.date_input(
-            "回測日期",
-            value=None,
-            min_value=date.today() - timedelta(days=365 * 3),
-            max_value=date.today() - timedelta(days=30),
-            format="YYYY-MM-DD",
-            help="選擇後以該日歷史資料執行篩選，並自動計算後續 30/90 天報酬率",
-        )
+        enable_backtest = st.checkbox("啟用回測驗證", value=False, help="用歷史日期驗證當天選出的股票，觀察 1 個月與 3 個月後報酬")
+        backtest_date = None
+        if enable_backtest:
+            st.markdown("**回測驗證**")
+            st.caption("選擇一個過去的日期，以該日的籌碼資料篩選股票，並計算之後 1 個月、3 個月的漲跌幅。")
+            backtest_date = st.date_input(
+                "回測日期",
+                value=date.today() - timedelta(days=90),
+                min_value=date.today() - timedelta(days=365 * 3),
+                max_value=date.today() - timedelta(days=30),
+                format="YYYY-MM-DD",
+                help="以該日歷史資料執行篩選，並自動計算後續 30/90 天報酬率",
+            )
+        else:
+            st.caption("若要看策略回測，請先勾選上方的「啟用回測驗證」。")
         enable_cache = st.checkbox("啟用磁碟快取", value=True)
         log_level = st.selectbox("Log 等級", options=["INFO", "DEBUG"], index=0)
-        submitted = st.form_submit_button("開始篩選", use_container_width=True)
+        submitted = st.form_submit_button("開始回測驗證" if enable_backtest else "開始篩選", use_container_width=True)
 
 
 if submitted:
