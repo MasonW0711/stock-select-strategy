@@ -52,13 +52,15 @@ def analyze_holder_change(
     latest_holder = latest_record['holder_count']
     latest_date = latest_record['week_date']
 
-    # 取得 N 週前的基準資料
-    if len(stock_holders) < observation_weeks:
-        # 資料不足 N 週，取最早的一筆作為基準
+    # 取得 N 週前的基準資料。
+    # 例如 observation_weeks=4 時，要比較「最新」與「4 週前」，
+    # 因此至少需要 5 筆資料（最新 + 往前 4 週）。
+    required_points = observation_weeks + 1
+    if len(stock_holders) < required_points:
+        # 資料不足完整區間時，退回以最早的一筆作為基準
         early_record = stock_holders.iloc[0]
     else:
-        # 從最新往回數 observation_weeks 筆
-        early_record = stock_holders.iloc[-(observation_weeks)]
+        early_record = stock_holders.iloc[-required_points]
 
     early_holder = early_record['holder_count']
     early_date = early_record['week_date']
@@ -102,7 +104,7 @@ def get_holder_history(
     取得指定股票近 N 週的集保戶數歷史資料。
 
     回傳:
-        依週別排序的 DataFrame（最多 observation_weeks 筆）
+        依週別排序的 DataFrame（最多 observation_weeks + 1 筆，含比較基準）
     """
     stock_holders = holder_df[holder_df['stock_id'] == stock_id].copy()
 
@@ -112,7 +114,8 @@ def get_holder_history(
     stock_holders = stock_holders.sort_values('week_date').reset_index(drop=True)
     stock_holders = stock_holders.drop_duplicates(subset=['week_date'], keep='last')
 
-    return stock_holders.tail(observation_weeks).reset_index(drop=True)
+    required_points = observation_weeks + 1
+    return stock_holders.tail(required_points).reset_index(drop=True)
 
 
 def _empty_holder_result() -> Dict[str, Any]:

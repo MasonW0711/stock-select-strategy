@@ -32,6 +32,12 @@ def find_consecutive_buying_streaks(
     """
     all_records = []
 
+    # 先建立每檔股票可觀察到的交易日序列，供後續判斷「中間缺一天」是否中斷。
+    stock_trade_dates = {
+        stock_id: sorted(group['date'].dropna().unique())
+        for stock_id, group in broker_df.groupby('stock_id')
+    }
+
     # 按股票代號與分點分組
     grouped = broker_df.groupby(['stock_id', 'branch'])
 
@@ -41,7 +47,7 @@ def find_consecutive_buying_streaks(
             group = group.sort_values('date').reset_index(drop=True)
 
             # 找出所有連續買超區段
-            streaks = _find_all_streaks(group)
+            streaks = _find_all_streaks(group, stock_trade_dates.get(stock_id, []))
 
             # 只保留最近一段有效的 streak（避免舊買超干擾判斷）
             valid_streaks = [s for s in streaks if len(s) >= min_days]
@@ -96,23 +102,34 @@ def find_consecutive_buying_streaks(
     return summary_df, all_records
 
 
-def _find_all_streaks(group: pd.DataFrame) -> List[List[dict]]:
+def _find_all_streaks(group: pd.DataFrame, stock_dates: List[pd.Timestamp]) -> List[List[dict]]:
     """
     在已排序的分組資料中，找出所有連續買超區段。
-    規則：net_buy <= 0 的記錄會中斷連續性，重新計算。
-    注意：若某日無記錄（缺失），不視為中斷（v1 行為）。
+    規則：
+    - net_buy <= 0 的記錄會中斷連續性，重新計算
+    - 若該股票在某個交易日有資料，但此分點當天缺資料，也視為中斷
     """
     streaks: List[List[dict]] = []
     current: List[dict] = []
 
-    for _, row in group.iterrows():
-        if row['net_buy'] > 0:
-            current.append(row.to_dict())
-        else:
-            # 遇到非正買超，儲存目前區段並重置
-            if current:
-                streaks.append(current)
-                current = []
+    if not stock_dates:
+        return streaks
+
+    branch_rows = group.drop_duplicates(subset=['date'], keep='last').set_index('date')
+
+    for trade_date in stock_dates:
+        if trade_date in branch_rows.index:
+            row = branch_rows.loc[trade_date]
+            if row['net_buy'] > 0:
+                row_dict = row.to_dict()
+                row_dict['date'] = trade_date
+                current.append(row_dict)
+                continue
+
+        # 遇到缺資料或非正買超，儲存目前區段並重置
+        if current:
+            streaks.append(current)
+            current = []
 
     # 別忘了最後一段未結束的區段
     if current:
