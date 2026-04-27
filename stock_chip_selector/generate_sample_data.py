@@ -13,8 +13,8 @@
 - 3711  日月光  ← 第三關失敗（集保戶數上升，應被過濾）
 
 預期篩選結果（3標的通過）：
-  排名 1：2454 聯發科  95分
-  排名 2：2330 台積電  90分
+  排名 1：2330 台積電  95分
+  排名 2：2454 聯發科  95分
   排名 3：2317 鴻海    90分
   3711 日月光 → 被集保戶數條件過濾
 
@@ -112,7 +112,7 @@ def generate_price_data():
 
     def make_prices(stock_id, stock_name, base, vol_base, dates):
         """以隨機漫步模擬價格，確保最後一天收盤為指定值"""
-        np.random.seed(hash(stock_id) % 2**32)
+        rng = np.random.default_rng(int(stock_id))
         prices = []
         close = base * 0.97  # 從稍低處開始
 
@@ -120,13 +120,13 @@ def generate_price_data():
             if i == len(dates) - 1:
                 close = base  # 最後一天固定為目標收盤價
             else:
-                change = np.random.uniform(-0.005, 0.007)
+                change = rng.uniform(-0.005, 0.007)
                 close = round(close * (1 + change), 1)
 
-            high = round(close * np.random.uniform(1.001, 1.015), 1)
-            low = round(close * np.random.uniform(0.985, 0.999), 1)
-            open_p = round(np.random.uniform(low, high), 1)
-            volume = int(vol_base * np.random.uniform(0.6, 1.5))
+            high = round(close * rng.uniform(1.001, 1.015), 1)
+            low = round(close * rng.uniform(0.985, 0.999), 1)
+            open_p = round(rng.uniform(low, high), 1)
+            volume = int(vol_base * rng.uniform(0.6, 1.5))
 
             prices.append((date, stock_id, stock_name, open_p, high, low, close, volume))
         return prices
@@ -208,8 +208,8 @@ if __name__ == '__main__':
 
     print('\n📁 所有範例檔案已儲存至 sample_data/ 目錄')
     print('\n預期篩選結果（使用預設參數執行後）：')
+    print('  ✅ 2330 台積電  ～ 95 分（5天買超，逐日增加，集保 -3%）')
     print('  ✅ 2454 聯發科  ～ 95 分（4天買超，逐日增加，集保 -5%）')
-    print('  ✅ 2330 台積電  ～ 90 分（5天買超，逐日增加，集保 -3%）')
     print('  ✅ 2317 鴻海    ～ 90 分（4天買超，逐日增加，集保 -4%）')
     print('  ❌ 3711 日月光  → 集保戶數上升 +3.75%，第三關過濾')
     print('  ❌ 2330 國泰台北 → 連續天數僅 2 天，第一關過濾')

@@ -4,11 +4,13 @@
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Mapping, Union
+
+HolderSource = Union[pd.DataFrame, Mapping[str, pd.DataFrame]]
 
 
 def analyze_holder_change(
-    holder_df: pd.DataFrame,
+    holder_df: HolderSource,
     stock_id: str,
     observation_weeks: int = 4,
     min_decrease_pct: float = 0.0
@@ -36,17 +38,9 @@ def analyze_holder_change(
         - pass_filter: 是否通過篩選條件（bool）
     """
     # 篩選該股票的集保資料
-    stock_holders = holder_df[holder_df['stock_id'] == stock_id].copy()
-
-    # 資料不存在時，回傳安全的預設值
+    stock_holders = _get_stock_holders(holder_df, stock_id)
     if stock_holders.empty:
         return _empty_holder_result()
-
-    # 依週別排序
-    stock_holders = stock_holders.sort_values('week_date').reset_index(drop=True)
-
-    # 去除同一週別重複資料，保留最後一筆
-    stock_holders = stock_holders.drop_duplicates(subset=['week_date'], keep='last')
 
     latest_record = stock_holders.iloc[-1]
     latest_holder = latest_record['holder_count']
@@ -96,7 +90,7 @@ def analyze_holder_change(
 
 
 def get_holder_history(
-    holder_df: pd.DataFrame,
+    holder_df: HolderSource,
     stock_id: str,
     observation_weeks: int = 4
 ) -> pd.DataFrame:
@@ -106,16 +100,25 @@ def get_holder_history(
     回傳:
         依週別排序的 DataFrame（最多 observation_weeks + 1 筆，含比較基準）
     """
-    stock_holders = holder_df[holder_df['stock_id'] == stock_id].copy()
-
+    stock_holders = _get_stock_holders(holder_df, stock_id)
     if stock_holders.empty:
         return pd.DataFrame()
 
-    stock_holders = stock_holders.sort_values('week_date').reset_index(drop=True)
-    stock_holders = stock_holders.drop_duplicates(subset=['week_date'], keep='last')
-
     required_points = observation_weeks + 1
     return stock_holders.tail(required_points).reset_index(drop=True)
+
+
+def build_holder_lookup(holder_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    依股票代號預先整理集保歷史，供篩選迴圈重複使用。
+    """
+    if holder_df.empty:
+        return {}
+
+    return {
+        stock_id: _prepare_stock_holders(group)
+        for stock_id, group in holder_df.groupby('stock_id', sort=False)
+    }
 
 
 def _empty_holder_result() -> Dict[str, Any]:
@@ -131,3 +134,25 @@ def _empty_holder_result() -> Dict[str, Any]:
         'is_decreasing': False,
         'pass_filter': False,
     }
+
+
+def _prepare_stock_holders(stock_holders: pd.DataFrame) -> pd.DataFrame:
+    return (
+        stock_holders
+        .sort_values('week_date')
+        .drop_duplicates(subset=['week_date'], keep='last')
+        .reset_index(drop=True)
+    )
+
+
+def _get_stock_holders(holder_source: HolderSource, stock_id: str) -> pd.DataFrame:
+    if isinstance(holder_source, Mapping):
+        stock_holders = holder_source.get(stock_id)
+        if stock_holders is None:
+            return pd.DataFrame()
+        return stock_holders.copy()
+
+    stock_holders = holder_source[holder_source['stock_id'] == stock_id].copy()
+    if stock_holders.empty:
+        return stock_holders
+    return _prepare_stock_holders(stock_holders)

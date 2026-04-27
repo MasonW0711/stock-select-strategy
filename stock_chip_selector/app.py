@@ -19,6 +19,7 @@ from broker_analyzer import find_consecutive_buying_streaks
 from charts import create_broker_volume_chart, create_holder_chart, create_price_chart
 from config import DEFAULT_CONFIG
 from cost_calculator import (
+    build_latest_close_lookup,
     calculate_average_cost,
     calculate_price_deviation,
     get_latest_close,
@@ -31,7 +32,7 @@ from data_loader import (
     load_price_data,
     merge_price_to_broker,
 )
-from holder_analyzer import analyze_holder_change, get_holder_history
+from holder_analyzer import analyze_holder_change, build_holder_lookup, get_holder_history
 from report_exporter import export_to_excel
 from scoring import calculate_score, get_score_label
 
@@ -192,6 +193,9 @@ if run_button:
         st.session_state['price_df'] = price_df
         st.session_state['holder_df'] = holder_df
 
+        latest_close_lookup = build_latest_close_lookup(price_df)
+        holder_lookup = build_holder_lookup(holder_df)
+
         # ── 步驟 2：合併股價補充缺失均價 ─────────────────────────────
         progress_bar.progress(50, text='合併股價資料...')
         merged_broker_df = merge_price_to_broker(broker_df, price_df)
@@ -227,7 +231,7 @@ if run_button:
 
         final_records = []
         broker_detail_rows = []
-        holder_histories = []
+        holder_histories = {}
 
         for result in all_results:
             stock_id = result['stock_id']
@@ -237,7 +241,7 @@ if run_button:
             try:
                 # ── 關卡 2：主力平均成本與現價偏離 ──────────────────
                 avg_cost = calculate_average_cost(streak_df)
-                latest_close = get_latest_close(price_df, stock_id)
+                latest_close = get_latest_close(price_df, stock_id) if stock_id not in latest_close_lookup else latest_close_lookup[stock_id]
 
                 if not np.isnan(avg_cost) and not np.isnan(latest_close):
                     deviation_pct = calculate_price_deviation(avg_cost, latest_close)
@@ -250,7 +254,7 @@ if run_button:
 
                 # ── 關卡 3：集保戶數下降 ─────────────────────────────
                 holder_info = analyze_holder_change(
-                    holder_df,
+                    holder_lookup,
                     stock_id,
                     observation_weeks=holder_observation_weeks,
                     min_decrease_pct=min_holder_decrease_pct,
@@ -300,13 +304,13 @@ if run_button:
                 final_records.append(record)
 
                 # 收集買超明細（用於 Excel Sheet 2）
-                for _, row in streak_df.iterrows():
-                    broker_detail_rows.append(row.to_dict())
+                broker_detail_rows.extend(streak_df.to_dict('records'))
 
                 # 收集集保歷史（用於 Excel Sheet 3）
-                history = get_holder_history(holder_df, stock_id, holder_observation_weeks)
-                if not history.empty:
-                    holder_histories.append(history)
+                if stock_id not in holder_histories:
+                    history = get_holder_history(holder_lookup, stock_id, holder_observation_weeks)
+                    if not history.empty:
+                        holder_histories[stock_id] = history
 
             except Exception as e:
                 st.warning(f'[{stock_id}/{branch}] 分析時發生錯誤，跳過：{e}')
@@ -330,7 +334,7 @@ if run_button:
         )
         broker_detail_df = pd.DataFrame(broker_detail_rows) if broker_detail_rows else pd.DataFrame()
         holder_history_df = (
-            pd.concat(holder_histories, ignore_index=True)
+            pd.concat(holder_histories.values(), ignore_index=True)
             if holder_histories else pd.DataFrame()
         )
 
@@ -570,6 +574,6 @@ else:
 |------|--------|------|
 | 連續買超天數 | 30 | 5天以上30分，4天25分，3天20分 |
 | 買超趨勢 | 20 | 逐日增加20分，大多增加15分，僅買超10分 |
-| 現價接近主力成本 | 25 | 偏離0~3%得25分，3~5%得20分，低於成本得15分 |
-| 集保戶數下降 | 25 | 降5%以上25分，降3~5%得20分，降0~3%得15分 |
+| 現價接近主力成本 | 25 | 偏離 0–3% 得 25 分，3–5% 得 20 分，低於成本得 15 分 |
+| 集保戶數下降 | 25 | 降 5% 以上得 25 分，降 3–5% 得 20 分，降 0–3% 得 15 分 |
 ''')

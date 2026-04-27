@@ -4,6 +4,7 @@
 
 import pandas as pd
 import numpy as np
+from typing import Dict
 
 
 def calculate_average_cost(streak_data: pd.DataFrame) -> float:
@@ -80,6 +81,20 @@ def get_latest_close(price_df: pd.DataFrame, stock_id: str) -> float:
 
     latest = stock_prices.sort_values('date').iloc[-1]
     return float(latest['close'])
+
+
+def build_latest_close_lookup(price_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    預先建立每檔股票的最新收盤價查找表，避免重複篩選與排序。
+    """
+    if price_df.empty:
+        return {}
+
+    latest_prices = (
+        price_df.sort_values(['stock_id', 'date'])
+        .drop_duplicates(subset=['stock_id'], keep='last')
+    )
+    return latest_prices.set_index('stock_id')['close'].astype(float).to_dict()
 
 
 def get_price_deviation_label(deviation_pct: float) -> str:
