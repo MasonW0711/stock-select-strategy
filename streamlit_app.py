@@ -275,8 +275,12 @@ if run_result:
         with tabs[3]:
             bt_frame = frames["backtest"]
             anchor_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else "?"
-            st.markdown(f"**篩選日期：{anchor_date_str}**　共 {len(bt_frame)} 檔通過篩選")
-            st.caption("⚠️ 本回測使用今日的股票清單，已下市或代號變更的股票可能無法抓到歷史資料。")
+            tdcc_anchor_date = getattr(summary, "backtest_tdcc_anchor_date", None)
+            tdcc_anchor_str = tdcc_anchor_date.isoformat() if tdcc_anchor_date else "?"
+            st.markdown(f"**篩選日期：{anchor_date_str}**　**TDCC 對齊週別：{tdcc_anchor_str}**　共 {len(bt_frame)} 檔通過篩選")
+            if tdcc_anchor_date is not None and tdcc_anchor_date != getattr(summary, "backtest_anchor_date", None):
+                st.caption("已使用小於等於指定日期的最近 TDCC 週資料做籌碼篩選；價格條件與後續報酬仍以你選的日期為準。")
+            st.caption("⚠️ 本回測會先依上市/上櫃日期排除當時尚未可交易股票，但仍以今日可取得的公司清單為基底；已下市或代號變更股票可能無法抓到歷史資料。")
 
             if bt_frame.empty:
                 st.info("這個回測日期目前沒有符合條件的股票，或價格資料不足，因此暫無可計算的後續報酬。")

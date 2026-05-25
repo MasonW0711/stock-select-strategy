@@ -136,6 +136,7 @@ def build_summary_text(summary: object) -> list[str]:
 
     market_counts = "、".join(f"{market}:{count}" for market, count in summary.market_counts.items()) if getattr(summary, "market_counts", None) else "無"
     start_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else ""
+    tdcc_anchor_str = summary.backtest_tdcc_anchor_date.isoformat() if getattr(summary, "backtest_tdcc_anchor_date", None) else ""
 
     return [
         f"執行時間：{summary.run_timestamp.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -151,6 +152,7 @@ def build_summary_text(summary: object) -> list[str]:
         f"最新 TDCC 日期：{summary.latest_tdcc_date.isoformat() if summary.latest_tdcc_date else ''}",
         f"TDCC 觀察日期：{', '.join(value.isoformat() for value in summary.target_tdcc_dates)}",
         f"回測起始日：{start_date_str}",
+        f"回測 TDCC 對齊日：{tdcc_anchor_str}",
         f"耗時秒數：{summary.elapsed_seconds:.2f}",
         f"警告：{'; '.join(summary.warnings) if summary.warnings else '無'}",
     ]

@@ -3,7 +3,7 @@ from datetime import date, datetime
 from api_clients import ApiClientError, TWSEApiClient
 from config import DEFAULT_CACHE_SETTINGS, DEFAULT_HTTP_SETTINGS, DEFAULT_SCREEN_PARAMETERS
 from config import DEFAULT_SCREEN_PARAMETERS
-from models import PriceBar, ScreenRunSummary, StockScreenResult
+from models import PriceBar, ScreenRunSummary, ShareholdingSnapshot, StockInfo, StockScreenResult
 from screener import StockScreener, build_output_frames
 
 
@@ -208,3 +208,145 @@ def test_twse_fetch_stock_day_history_skips_months_on_api_client_error():
     bars = client.fetch_stock_day_history("2330", months=1)
 
     assert bars == []
+
+
+class _StubLatestTdccClient:
+    def __init__(self, latest_snapshot: ShareholdingSnapshot, latest_tdcc_date: date):
+        self.latest_snapshot = latest_snapshot
+        self.latest_tdcc_date = latest_tdcc_date
+
+    def fetch_latest_market_snapshots(self):
+        return ({self.latest_snapshot.stock_code: self.latest_snapshot}, self.latest_tdcc_date)
+
+
+class _StubHistoryTdccClient:
+    def __init__(self, available_dates: list[date]):
+        self.available_dates = available_dates
+
+    def get_available_dates(self):
+        return list(self.available_dates)
+
+
+def test_run_screening_uses_requested_backtest_date_for_price_anchor(monkeypatch):
+    screener = _make_screener()
+    requested_date = date(2026, 4, 9)
+    latest_tdcc_date = date(2026, 4, 10)
+    latest_snapshot = ShareholdingSnapshot(
+        stock_code="2330",
+        stock_name="台積電",
+        data_date=latest_tdcc_date,
+        buckets=[],
+        source="test",
+    )
+    screener.tdcc_latest_client = _StubLatestTdccClient(latest_snapshot=latest_snapshot, latest_tdcc_date=latest_tdcc_date)
+    screener.tdcc_history_client = _StubHistoryTdccClient(
+        available_dates=[latest_tdcc_date, date(2026, 4, 3), date(2026, 3, 27)],
+    )
+
+    stock_info = StockInfo(
+        code="2330",
+        name="台積電",
+        short_name="台積電",
+        market="上市",
+        listed_date=None,
+        industry=None,
+        is_ky=False,
+    )
+    monkeypatch.setattr(screener, "_load_stock_universe", lambda markets: {"2330": stock_info})
+
+    captured: dict[str, object] = {}
+
+    def fake_screen_single_stock(
+        stock_info: StockInfo,
+        latest_snapshot: ShareholdingSnapshot,
+        target_tdcc_dates: list[date],
+        as_of_date: date | None = None,
+        effective_price_months: int | None = None,
+    ) -> StockScreenResult:
+        captured["target_tdcc_dates"] = list(target_tdcc_dates)
+        captured["as_of_date"] = as_of_date
+        return StockScreenResult(code=stock_info.code, name=stock_info.name, market=stock_info.market)
+
+    monkeypatch.setattr(screener, "_screen_single_stock", fake_screen_single_stock)
+
+    _, summary = screener.run_screening(stock_limit=1, markets=("listed",), start_date=requested_date)
+
+    assert captured["target_tdcc_dates"][0] == date(2026, 4, 3)
+    assert captured["as_of_date"] == requested_date
+    assert summary.backtest_anchor_date == requested_date
+    assert summary.backtest_tdcc_anchor_date == date(2026, 4, 3)
+
+
+def test_run_screening_backtest_filters_pre_listing_stocks_and_keeps_missing_latest_snapshot(monkeypatch):
+    screener = _make_screener()
+    requested_date = date(2026, 4, 9)
+    latest_tdcc_date = date(2026, 4, 10)
+    latest_snapshot = ShareholdingSnapshot(
+        stock_code="1111",
+        stock_name="已上市且有最新快照",
+        data_date=latest_tdcc_date,
+        buckets=[],
+        source="test",
+    )
+    screener.tdcc_latest_client = _StubLatestTdccClient(latest_snapshot=latest_snapshot, latest_tdcc_date=latest_tdcc_date)
+    screener.tdcc_history_client = _StubHistoryTdccClient(
+        available_dates=[latest_tdcc_date, date(2026, 4, 3), date(2026, 3, 27)],
+    )
+
+    prelisted_with_latest = StockInfo(
+        code="1111",
+        name="已上市且有最新快照",
+        short_name="1111",
+        market="上市",
+        listed_date=date(2010, 1, 1),
+        industry=None,
+        is_ky=False,
+    )
+    prelisted_missing_latest = StockInfo(
+        code="3333",
+        name="已上市但缺最新快照",
+        short_name="3333",
+        market="上市",
+        listed_date=date(2012, 1, 1),
+        industry=None,
+        is_ky=False,
+    )
+    not_listed_yet = StockInfo(
+        code="9999",
+        name="回測日尚未上市",
+        short_name="9999",
+        market="上市",
+        listed_date=date(2026, 5, 1),
+        industry=None,
+        is_ky=False,
+    )
+    monkeypatch.setattr(
+        screener,
+        "_load_stock_universe",
+        lambda markets: {
+            "1111": prelisted_with_latest,
+            "3333": prelisted_missing_latest,
+            "9999": not_listed_yet,
+        },
+    )
+
+    captured_calls: list[tuple[str, ShareholdingSnapshot | None]] = []
+
+    def fake_screen_single_stock(
+        stock_info: StockInfo,
+        latest_snapshot: ShareholdingSnapshot | None,
+        target_tdcc_dates: list[date],
+        as_of_date: date | None = None,
+        effective_price_months: int | None = None,
+    ) -> StockScreenResult:
+        captured_calls.append((stock_info.code, latest_snapshot))
+        return StockScreenResult(code=stock_info.code, name=stock_info.name, market=stock_info.market)
+
+    monkeypatch.setattr(screener, "_screen_single_stock", fake_screen_single_stock)
+
+    _, summary = screener.run_screening(stock_limit=None, markets=("listed",), start_date=requested_date)
+
+    assert [stock_code for stock_code, _ in captured_calls] == ["1111", "3333"]
+    assert captured_calls[0][1] is not None
+    assert captured_calls[1][1] is None
+    assert summary.total_universe == 2

@@ -50,7 +50,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. 執行語法檢查與測試：
+1. 執行語法檢查與測試：
 
 ```bash
 # 安裝測試工具
@@ -76,7 +76,7 @@ pytest -q
 
 若要在 README 上顯示 badge，可使用：
 
-```
+```text
 ![CI](https://github.com/MasonW0711/stock-select-strategy/actions/workflows/ci.yml/badge.svg)
 ```
 
@@ -118,6 +118,19 @@ python3 main.py --disable-cache
 python3 main.py --output ./result.xlsx
 ```
 
+1. 指定歷史日期做單日回測驗證
+
+```bash
+python3 main.py --start-date 2026-04-09 --stock-limit 30
+```
+
+回測模式說明：
+
+1. 籌碼條件會使用小於等於指定日期的最近 TDCC 週資料
+2. 價格條件與 1 個月、3 個月後報酬，會以你指定的日期作為 anchor 計算
+3. 會先依上市/上櫃日期排除回測日尚未可交易的股票，讓歷史股票集合更接近當時市場
+4. 目前仍以當前可取得的股票清單為基底，已下市或代號變更股票可能缺漏
+
 ## Streamlit 執行方式
 
 1. 啟動介面
@@ -127,8 +140,10 @@ streamlit run streamlit_app.py
 ```
 
 1. 在左側調整市場、週數、價格條件、是否啟用快取
-2. 按下「開始篩選」
-3. 畫面會顯示通過清單、失敗清單、raw_data_summary，並自動把 Excel 寫到專案資料夾
+2. 若要驗證歷史日期，勾選「啟用回測驗證」並選擇回測日期
+3. 按下「開始篩選」或「開始回測驗證」
+4. 畫面會顯示通過清單、失敗清單、raw_data_summary；回測模式會額外顯示 backtest 工作表與績效統計
+5. 回測結果會同時標示使用者指定日期與實際對齊的 TDCC 週別，並自動把 Excel 寫到專案資料夾
 
 ## 選股邏輯
 
@@ -170,11 +185,15 @@ TDCC 官方分級不是每一張都切得很細，因此程式採用 metadata �
 4. Excel 完整輸出路徑
 5. pass / fail 表格
 
-Excel 檔包含三個工作表：
+Excel 檔預設包含三個工作表：
 
 1. pass：通過的股票
 2. fail：未通過的股票
 3. raw_data_summary：每檔股票的資料完整度、TDCC 週數、價格天數與失敗原因
+
+若使用回測模式，會額外加入：
+
+1. backtest：通過篩選股票的篩選日收盤價、篩選日期、1 個月後報酬率、3 個月後報酬率
 
 預設檔名格式為：
 

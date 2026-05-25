@@ -109,3 +109,4 @@ class ScreenRunSummary:
     failure_category_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     backtest_anchor_date: date | None = None
+    backtest_tdcc_anchor_date: date | None = None

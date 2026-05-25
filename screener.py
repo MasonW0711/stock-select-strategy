@@ -59,19 +59,36 @@ class StockScreener:
         if len(target_tdcc_dates) < self.screen_params.min_history_weeks:
             warnings.append("TDCC 可用週數少於最低需求，結果可能不完整。")
 
-        universe_codes = [code for code in listed_stocks if code in latest_snapshots]
+        eligible_stocks = listed_stocks
+        if start_date is not None:
+            eligible_stocks, excluded_future_listing_count, unknown_listing_date_count = self._filter_stock_universe_for_backtest(
+                listed_stocks,
+                anchor_date=start_date,
+            )
+            if excluded_future_listing_count > 0:
+                warnings.append(f"已依上市/上櫃日期排除 {excluded_future_listing_count} 檔回測日尚未可交易股票。")
+            if unknown_listing_date_count > 0:
+                warnings.append(f"有 {unknown_listing_date_count} 檔股票缺少上市/上櫃日期，回測時先保留在股票集合中。")
+
+        if start_date is None:
+            universe_codes = [code for code in eligible_stocks if code in latest_snapshots]
+        else:
+            universe_codes = list(eligible_stocks)
         if stock_limit is not None:
             universe_codes = universe_codes[:stock_limit]
 
-        missing_latest_tdcc = len(listed_stocks) - len([code for code in listed_stocks if code in latest_snapshots])
+        missing_latest_tdcc = len(eligible_stocks) - len([code for code in eligible_stocks if code in latest_snapshots])
         if missing_latest_tdcc > 0:
-            warnings.append(f"有 {missing_latest_tdcc} 檔上市股票缺少最新 TDCC 快照。")
+            if start_date is None:
+                warnings.append(f"有 {missing_latest_tdcc} 檔上市股票缺少最新 TDCC 快照。")
+            else:
+                warnings.append(f"回測模式有 {missing_latest_tdcc} 檔股票缺少最新 TDCC 快照，改由歷史 TDCC 週資料補查。")
 
-        # 回測模式：以 target_tdcc_dates[0] 為錨點，動態計算需要抓多久的價格資料
+        # 回測模式下，TDCC 週資料可向前對齊，但價格篩選與後續報酬仍應以使用者指定日為錨點
         effective_as_of_date: date | None = None
         effective_price_months = self.screen_params.price_history_months
-        if start_date is not None and target_tdcc_dates:
-            effective_as_of_date = target_tdcc_dates[0]
+        if start_date is not None:
+            effective_as_of_date = start_date
             today = date.today()
             months_since_anchor = (today.year - effective_as_of_date.year) * 12 + (today.month - effective_as_of_date.month) + 1
             effective_price_months = max(self.screen_params.price_history_months, min(months_since_anchor + 4, 24))
@@ -79,8 +96,8 @@ class StockScreener:
         results: list[StockScreenResult] = []
         for index, stock_code in enumerate(universe_codes, start=1):
             result = self._screen_single_stock(
-                stock_info=listed_stocks[stock_code],
-                latest_snapshot=latest_snapshots[stock_code],
+                stock_info=eligible_stocks[stock_code],
+                latest_snapshot=latest_snapshots.get(stock_code),
                 target_tdcc_dates=target_tdcc_dates,
                 as_of_date=effective_as_of_date,
                 effective_price_months=effective_price_months,
@@ -91,14 +108,15 @@ class StockScreener:
 
         summary = self._build_run_summary(
             results=results,
-            total_universe=len(listed_stocks),
+            total_universe=len(eligible_stocks),
             latest_tdcc_date=latest_tdcc_date,
             target_tdcc_dates=target_tdcc_dates,
-            market_counts=dict(Counter(stock.market for stock in listed_stocks.values())),
-            skipped_count=(len(listed_stocks) - len(universe_codes)),
+            market_counts=dict(Counter(stock.market for stock in eligible_stocks.values())),
+            skipped_count=(len(eligible_stocks) - len(universe_codes)),
             warnings=warnings,
             elapsed_seconds=time.perf_counter() - started_at,
             backtest_anchor_date=effective_as_of_date,
+            backtest_tdcc_anchor_date=target_tdcc_dates[0] if start_date is not None and target_tdcc_dates else None,
         )
         return results, summary
 
@@ -116,6 +134,27 @@ class StockScreener:
                 otc_stocks.pop(stock_code, None)
             universe.update(otc_stocks)
         return dict(sorted(universe.items()))
+
+    def _filter_stock_universe_for_backtest(
+        self,
+        universe: dict[str, StockInfo],
+        anchor_date: date,
+    ) -> tuple[dict[str, StockInfo], int, int]:
+        """依回測日期排除尚未上市/上櫃的股票，讓 universe 更接近當時可交易集合。"""
+
+        eligible: dict[str, StockInfo] = {}
+        excluded_future_listing_count = 0
+        unknown_listing_date_count = 0
+        for stock_code, stock_info in universe.items():
+            if stock_info.listed_date is None:
+                unknown_listing_date_count += 1
+                eligible[stock_code] = stock_info
+                continue
+            if stock_info.listed_date <= anchor_date:
+                eligible[stock_code] = stock_info
+            else:
+                excluded_future_listing_count += 1
+        return eligible, excluded_future_listing_count, unknown_listing_date_count
 
     def _resolve_group_bucket_ids(self) -> dict[str, list[int]]:
         """依分級 metadata 自動推導三組持股區間對應的 bucket ids。"""
@@ -178,7 +217,7 @@ class StockScreener:
     def _screen_single_stock(
         self,
         stock_info: StockInfo,
-        latest_snapshot: ShareholdingSnapshot,
+        latest_snapshot: ShareholdingSnapshot | None,
         target_tdcc_dates: list[date],
         as_of_date: date | None = None,
         effective_price_months: int | None = None,
@@ -264,7 +303,7 @@ class StockScreener:
     def _load_tdcc_snapshots(
         self,
         stock_info: StockInfo,
-        latest_snapshot: ShareholdingSnapshot,
+        latest_snapshot: ShareholdingSnapshot | None,
         target_tdcc_dates: list[date],
         result: StockScreenResult,
     ) -> list[ShareholdingSnapshot]:
@@ -272,7 +311,7 @@ class StockScreener:
 
         snapshots: list[ShareholdingSnapshot] = []
         for target_date in target_tdcc_dates:
-            if latest_snapshot.data_date == target_date:
+            if latest_snapshot is not None and latest_snapshot.data_date == target_date:
                 latest_snapshot.stock_name = stock_info.short_name or stock_info.name
                 snapshots.append(latest_snapshot)
                 continue
@@ -407,6 +446,7 @@ class StockScreener:
         warnings: list[str],
         elapsed_seconds: float,
         backtest_anchor_date: date | None = None,
+        backtest_tdcc_anchor_date: date | None = None,
     ) -> ScreenRunSummary:
         """彙整整次篩選執行的摘要資訊。"""
 
@@ -430,6 +470,7 @@ class StockScreener:
             failure_category_counts=dict(failure_counter),
             warnings=warnings,
             backtest_anchor_date=backtest_anchor_date,
+            backtest_tdcc_anchor_date=backtest_tdcc_anchor_date,
         )
 
     def _categorize_failure(self, fail_reasons: list[str]) -> str:
