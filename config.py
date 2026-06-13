@@ -52,6 +52,12 @@ class ScreenParameters:
     price_history_months: int = 4
     tdcc_date_buffer_weeks: int = 6
     trend_mode: Literal["strict"] = "strict"
+    # 近 N 個交易日報酬回看窗，與 min_price_days（最低資料量）解耦
+    return_lookback_days: int = 60
+    # 集保總戶數下降條件（融合自原 stock_chip_selector 三關之一，改吃線上 TDCC 合計列）
+    require_holder_decrease: bool = True
+    holder_decrease_weeks: int = 3
+    min_holder_decrease_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -143,3 +149,25 @@ TPEX_COMPANY_FIELD_ALIASES = {
     "industry": ["SecuritiesIndustryCode"],
     "listed_date": ["DateOfListing"],
 }
+
+# ── 選股評分門檻（0-100，scoring.py 的唯一真實來源） ──────────────────────
+# 每組為 (門檻, 分數) 由「最佳」往「最差」排列；scoring 取第一個符合者。
+# 四個維度滿分相加 = 30 + 25 + 25 + 20 = 100。
+#
+# 設計理念（融合 stock_chip_selector 的評分精神，改吃線上可得訊號）：
+#   大戶人數增幅  ← 取代「連續買超強度／主力吸籌」
+#   集保總戶數降幅 ← 對應原「集保戶數下降」
+#   距 20MA       ← 取代原「現價接近主力成本」
+#   近三月漲幅溫和 ← 價格未過熱、仍有上行空間
+
+# 大戶（>1000 張）人數自最早觀察週到最新週的增幅（ratio，越大越好）→ 分數
+SCORE_LARGE_HOLDER_GROWTH = ((0.10, 30), (0.05, 24), (0.02, 18), (0.0, 12))
+# 集保總戶數降幅（取下降的絕對 ratio，越大越好）→ 分數
+SCORE_HOLDER_DECLINE = ((0.05, 25), (0.03, 20), (0.01, 15), (0.0, 10))
+# 距 20MA 的距離（ratio，越小越好；門檻為「不超過」）→ 分數
+SCORE_MA_PROXIMITY = ((0.02, 25), (0.04, 20), (0.06, 15), (0.08, 10))
+# 近三月漲幅（ratio，越溫和越好；門檻為「不超過」）→ 分數
+SCORE_RETURN_MILDNESS = ((0.10, 20), (0.20, 15), (0.30, 10), (0.40, 5))
+
+# 綜合分數的評級標籤門檻（分數 >= 門檻 即套用該標籤，由高往低）
+SCORE_LABEL_THRESHOLDS = ((85, "⭐⭐⭐ 強力推薦"), (70, "⭐⭐ 值得關注"), (55, "⭐ 符合條件"), (0, "基本符合"))

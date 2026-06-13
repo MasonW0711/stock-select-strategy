@@ -30,7 +30,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-3m-return", type=float, default=DEFAULT_SCREEN_PARAMETERS.max_3m_return, help="近三個月最大漲幅上限，例如 0.4")
     parser.add_argument("--max-distance-to-ma", type=float, default=DEFAULT_SCREEN_PARAMETERS.max_distance_to_ma, help="距離 20MA 最大允許比例，例如 0.08")
     parser.add_argument("--min-price-days", type=int, default=DEFAULT_SCREEN_PARAMETERS.min_price_days, help="最低價格資料日數")
+    parser.add_argument("--return-lookback-days", type=int, default=DEFAULT_SCREEN_PARAMETERS.return_lookback_days, help="近三月漲幅回看的交易日數（與最低資料量解耦）")
     parser.add_argument("--price-history-months", type=int, default=DEFAULT_SCREEN_PARAMETERS.price_history_months, help="往回抓取 TWSE 月資料的月份數")
+    parser.add_argument("--holder-decrease-weeks", type=int, default=DEFAULT_SCREEN_PARAMETERS.holder_decrease_weeks, help="集保總戶數比較的週距（最新 vs N 週前）")
+    parser.add_argument("--min-holder-decrease", type=float, default=DEFAULT_SCREEN_PARAMETERS.min_holder_decrease_ratio, help="集保總戶數最小下降比例，例如 0.03 表示需下降 3%")
+    parser.add_argument("--no-holder-decrease", action="store_true", help="停用集保總戶數下降的硬性過濾（仍會計入評分）")
     parser.add_argument("--markets", type=str, default=",".join(DEFAULT_MARKETS), help="市場範圍，例如 listed,otc 或 listed")
     parser.add_argument("--disable-cache", action="store_true", help="停用本地磁碟快取")
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_SETTINGS.cache_dir, help="指定快取資料夾路徑")
@@ -58,6 +62,10 @@ def build_screen_parameters(args: argparse.Namespace) -> ScreenParameters:
         price_history_months=max(args.price_history_months, 1),
         tdcc_date_buffer_weeks=DEFAULT_SCREEN_PARAMETERS.tdcc_date_buffer_weeks,
         trend_mode=DEFAULT_SCREEN_PARAMETERS.trend_mode,
+        return_lookback_days=max(args.return_lookback_days, 1),
+        require_holder_decrease=not args.no_holder_decrease,
+        holder_decrease_weeks=max(args.holder_decrease_weeks, 1),
+        min_holder_decrease_ratio=max(args.min_holder_decrease, 0.0),
     )
 
 
@@ -166,13 +174,27 @@ def resolve_output_path(output_argument: str) -> Path:
     return Path.cwd() / f"{DEFAULT_OUTPUT_BASENAME}_{date.today():%Y%m%d}.xlsx"
 
 
+def _excel_safe_cell(value: object) -> object:
+    """防 Excel 公式注入：對以 =、@、或 +/- 後接非數字開頭的字串前置單引號。
+
+    `-3.21%` 這類合法負數/百分比字串（- 後接數字）不會被改動。
+    """
+
+    if isinstance(value, str) and value:
+        first = value[0]
+        if first in ("=", "@") or (first in ("+", "-") and len(value) > 1 and not value[1].isdigit()):
+            return "'" + value
+    return value
+
+
 def frames_to_excel_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
-    """將 pass、fail、raw_data_summary 轉成 xlsx bytes。"""
+    """將 pass、fail、raw_data_summary 轉成 xlsx bytes（含公式注入防護）。"""
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for sheet_name, frame in frames.items():
-            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            safe_frame = frame.map(_excel_safe_cell) if not frame.empty else frame
+            safe_frame.to_excel(writer, sheet_name=sheet_name, index=False)
     return buffer.getvalue()
 
 

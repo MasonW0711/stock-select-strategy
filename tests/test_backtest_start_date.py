@@ -34,7 +34,11 @@ def test_resolve_target_dates_with_start_date():
     start = date(2026, 4, 3)
     resolved = screener._resolve_target_tdcc_dates(available, latest, start_date=start, warnings=[])
     assert resolved[0] == start
-    assert len(resolved) == max(DEFAULT_SCREEN_PARAMETERS.consecutive_weeks, DEFAULT_SCREEN_PARAMETERS.min_history_weeks)
+    assert len(resolved) == max(
+        DEFAULT_SCREEN_PARAMETERS.consecutive_weeks,
+        DEFAULT_SCREEN_PARAMETERS.min_history_weeks,
+        DEFAULT_SCREEN_PARAMETERS.holder_decrease_weeks + 1,
+    )
 
 
 def test_resolve_target_dates_without_start_date_includes_latest():
@@ -43,7 +47,11 @@ def test_resolve_target_dates_without_start_date_includes_latest():
     latest = date(2026, 4, 10)
     resolved = screener._resolve_target_tdcc_dates(available, latest, start_date=None, warnings=[])
     assert resolved[0] == latest
-    assert len(resolved) == max(DEFAULT_SCREEN_PARAMETERS.consecutive_weeks, DEFAULT_SCREEN_PARAMETERS.min_history_weeks)
+    assert len(resolved) == max(
+        DEFAULT_SCREEN_PARAMETERS.consecutive_weeks,
+        DEFAULT_SCREEN_PARAMETERS.min_history_weeks,
+        DEFAULT_SCREEN_PARAMETERS.holder_decrease_weeks + 1,
+    )
 
 
 def test_resolve_target_dates_start_date_after_latest_uses_latest():
@@ -186,6 +194,8 @@ def test_build_output_frames_creates_empty_backtest_frame_when_requested():
         "股票代號",
         "股票名稱",
         "市場",
+        "選股分數",
+        "評級",
         "篩選日收盤價",
         "篩選日期",
         "1個月後報酬率",

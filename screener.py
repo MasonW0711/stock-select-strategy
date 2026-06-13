@@ -11,6 +11,7 @@ import pandas as pd
 from api_clients import ApiClientError, DataNotFoundError, TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
 from config import ScreenParameters, TDCC_BUCKET_DEFINITIONS, TDCC_HOLDER_GROUPS
 from models import PriceBar, ScreenRunSummary, ShareholdingSnapshot, StockInfo, StockScreenResult
+from scoring import calculate_score, get_score_label
 from utils import format_ratio_as_pct, format_trend_values
 
 
@@ -84,14 +85,20 @@ class StockScreener:
             else:
                 warnings.append(f"回測模式有 {missing_latest_tdcc} 檔股票缺少最新 TDCC 快照，改由歷史 TDCC 週資料補查。")
 
-        # 回測模式下，TDCC 週資料可向前對齊，但價格篩選與後續報酬仍應以使用者指定日為錨點
+        # 回測模式下，TDCC 週資料可向前對齊，但價格篩選與後續報酬仍應以使用者指定日為錨點。
+        # 抓價窗需同時涵蓋：anchor 之前足夠的 K 線（>= min_price_days 與 return_lookback_days）、
+        # 以及 anchor 之後最大遠期報酬窗（90 天 ≈ 5 個月）。
         effective_as_of_date: date | None = None
         effective_price_months = self.screen_params.price_history_months
         if start_date is not None:
             effective_as_of_date = start_date
             today = date.today()
-            months_since_anchor = (today.year - effective_as_of_date.year) * 12 + (today.month - effective_as_of_date.month) + 1
-            effective_price_months = max(self.screen_params.price_history_months, min(months_since_anchor + 4, 24))
+            trading_days_needed = max(self.screen_params.min_price_days, self.screen_params.return_lookback_days)
+            months_before_anchor = max(self.screen_params.price_history_months, trading_days_needed // 20 + 2)
+            months_forward = 5  # 覆蓋 90 天遠期報酬
+            months_since_anchor = (today.year - effective_as_of_date.year) * 12 + (today.month - effective_as_of_date.month)
+            # iter_recent_month_starts 由 today 往回數，因此要把「今天到 anchor」的距離一併納入
+            effective_price_months = min(months_since_anchor + months_before_anchor + months_forward, 48)
 
         results: list[StockScreenResult] = []
         for index, stock_code in enumerate(universe_codes, start=1):
@@ -190,7 +197,11 @@ class StockScreener:
         若使用者提供 `start_date`，會以該日期為錨點向回選取最近 N 週；若 `start_date` 晚於最新 TDCC，會回退使用 latest_tdcc_date 並加入 warning（若提供 warnings list）。
         """
 
-        required_weeks = max(self.screen_params.consecutive_weeks, self.screen_params.min_history_weeks)
+        required_weeks = max(
+            self.screen_params.consecutive_weeks,
+            self.screen_params.min_history_weeks,
+            self.screen_params.holder_decrease_weeks + 1,
+        )
         # 決定 anchor（以 start_date 為優先，但不超過 latest_tdcc_date）
         anchor = latest_tdcc_date
         if start_date is not None:
@@ -241,6 +252,7 @@ class StockScreener:
         result.small_holder_trend = small_trend
         result.mid_holder_trend = mid_trend
         result.large_holder_trend = large_trend
+        result.large_holder_growth = self._growth_ratio(large_trend)
 
         if len(snapshots) < self.screen_params.min_history_weeks:
             result.fail_reasons.append("TDCC 週資料不足")
@@ -269,6 +281,13 @@ class StockScreener:
             result.passed = False
             return result
 
+        # 集保總戶數下降條件（融合自 stock_chip_selector，改吃 TDCC 合計列總戶數）。
+        # 資料週數不足時直接判不通過，不做靜默 fallback，避免短窗訊號被誤標成長窗。
+        self._apply_holder_decrease(snapshots=snapshots, result=result)
+        if self.screen_params.require_holder_decrease and not result.passed_holder_decrease:
+            result.passed = False
+            return result
+
         price_months = effective_price_months if effective_price_months is not None else self.screen_params.price_history_months
         price_client = self._resolve_price_client(stock_info.market)
         try:
@@ -288,7 +307,17 @@ class StockScreener:
         # 回測模式：計算篩選日後的遠期報酬率（僅針對通過籌碼條件的股票）
         if as_of_date is not None and result.passed_shareholding:
             result.forward_returns = self._compute_forward_returns(price_bars=price_bars, anchor_date=as_of_date)
-        result.passed = result.passed_shareholding and result.passed_price and len(result.fail_reasons) == 0
+        holder_ok = result.passed_holder_decrease or not self.screen_params.require_holder_decrease
+        result.passed = result.passed_shareholding and result.passed_price and holder_ok and len(result.fail_reasons) == 0
+        if result.passed:
+            decline_for_score = max(-(result.holder_change_ratio or 0.0), 0.0)
+            result.score = calculate_score(
+                large_holder_growth=result.large_holder_growth,
+                holder_decline=decline_for_score,
+                distance_to_ma=result.distance_to_ma20,
+                three_month_return=result.three_month_return,
+            )
+            result.score_label = get_score_label(result.score)
         return result
 
     def _resolve_price_client(self, market: str) -> TWSEApiClient | TPEXApiClient:
@@ -310,23 +339,91 @@ class StockScreener:
         """依目標日期序列抓取單一股票的所有 TDCC 週資料。"""
 
         snapshots: list[ShareholdingSnapshot] = []
+        # target_tdcc_dates 由新到舊排列。逐週抓取，一旦分級三條任一已不可能通過，
+        # 就停止後續週查詢（early-exit），可在全市場掃描時省下大量 TDCC POST。
         for target_date in target_tdcc_dates:
             if latest_snapshot is not None and latest_snapshot.data_date == target_date:
                 latest_snapshot.stock_name = stock_info.short_name or stock_info.name
                 snapshots.append(latest_snapshot)
-                continue
-            try:
-                historical_snapshot = self.tdcc_history_client.fetch_snapshot(stock_code=stock_info.code, query_date=target_date)
-                historical_snapshot.stock_name = stock_info.short_name or stock_info.name
-                snapshots.append(historical_snapshot)
-            except DataNotFoundError:
-                result.source_notes.append(f"TDCC 缺少 {target_date.isoformat()} 週資料")
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("TDCC 歷史資料抓取失敗：%s %s (%s)", stock_info.code, target_date.isoformat(), exc)
-                result.source_notes.append(f"TDCC 歷史查詢失敗：{target_date.isoformat()}")
+            else:
+                try:
+                    historical_snapshot = self.tdcc_history_client.fetch_snapshot(stock_code=stock_info.code, query_date=target_date)
+                    historical_snapshot.stock_name = stock_info.short_name or stock_info.name
+                    snapshots.append(historical_snapshot)
+                except DataNotFoundError:
+                    result.source_notes.append(f"TDCC 缺少 {target_date.isoformat()} 週資料")
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("TDCC 歷史資料抓取失敗：%s %s (%s)", stock_info.code, target_date.isoformat(), exc)
+                    result.source_notes.append(f"TDCC 歷史查詢失敗：{target_date.isoformat()}")
+
+            if self._shareholding_trend_doomed(snapshots):
+                result.source_notes.append("分級趨勢提前判定不符，已略過後續週查詢")
+                break
 
         snapshots.sort(key=lambda snapshot: snapshot.data_date, reverse=True)
         return snapshots
+
+    def _shareholding_trend_doomed(self, snapshots: list[ShareholdingSnapshot]) -> bool:
+        """已抓到的最新數週中，分級三條任一已不可能再符合 → 可提前結束抓取。"""
+
+        if len(snapshots) < 2:
+            return False
+        window = sorted(snapshots, key=lambda snapshot: snapshot.data_date, reverse=True)[: self.screen_params.consecutive_weeks]
+        checks = (("small_holders", "decrease"), ("mid_holders", "increase"), ("large_holders", "increase"))
+        for group_key, direction in checks:
+            values = [self._aggregate_holder_count(snapshot, group_key) for snapshot in window]
+            if not self._prefix_can_still_pass(values, direction):
+                return True
+        return False
+
+    @staticmethod
+    def _prefix_can_still_pass(values: list[int | None], direction: str) -> bool:
+        """判斷由新到舊的人數前綴是否仍有機會在補滿後維持嚴格單調。"""
+
+        if any(value is None for value in values):
+            return False
+        if direction == "increase":
+            return all(values[index] > values[index + 1] for index in range(len(values) - 1))
+        return all(values[index] < values[index + 1] for index in range(len(values) - 1))
+
+    @staticmethod
+    def _growth_ratio(trend: list[int | None]) -> float | None:
+        """以「最新 vs 觀察窗最舊」計算族群人數增幅 ratio（新到舊序列）。"""
+
+        valid = [value for value in trend if value is not None]
+        if len(valid) < 2 or not valid[-1]:
+            return None
+        return (valid[0] - valid[-1]) / valid[-1]
+
+    def _apply_holder_decrease(self, snapshots: list[ShareholdingSnapshot], result: StockScreenResult) -> None:
+        """套用集保總戶數近 N 週下降條件；資料不足直接判不通過，不靜默 fallback。"""
+
+        weeks = self.screen_params.holder_decrease_weeks
+        totals = [snapshot.total_holder_count() for snapshot in snapshots]
+        result.total_holder_trend = totals[: weeks + 1]
+
+        if len(totals) < weeks + 1 or totals[0] is None or totals[weeks] is None:
+            result.passed_holder_decrease = False
+            if self.screen_params.require_holder_decrease:
+                result.fail_reasons.append("集保總戶數資料不足")
+            return
+
+        latest_total, early_total = totals[0], totals[weeks]
+        result.latest_total_holders = latest_total
+        result.early_total_holders = early_total
+        if early_total == 0:
+            result.passed_holder_decrease = False
+            if self.screen_params.require_holder_decrease:
+                result.fail_reasons.append("集保總戶數基準為 0")
+            return
+
+        change_ratio = (latest_total - early_total) / early_total
+        result.holder_change_ratio = change_ratio
+        decline = -change_ratio  # 下降時為正
+        passed = decline > 0 and decline >= self.screen_params.min_holder_decrease_ratio
+        result.passed_holder_decrease = passed
+        if not passed and self.screen_params.require_holder_decrease:
+            result.fail_reasons.append("集保總戶數未下降" if decline <= 0 else "集保總戶數下降幅度不足")
 
     def _build_holder_trend(self, snapshots: list[ShareholdingSnapshot], group_key: str) -> list[int | None]:
         """將連續週快照聚合成單一持股族群的人數序列。"""
@@ -379,8 +476,10 @@ class StockScreener:
             result.passed_price = False
             return
 
-        base_window = valid_bars[-self.screen_params.min_price_days :]
-        base_close = base_window[0].close_price
+        # 報酬回看窗與「最低資料量」解耦：用 return_lookback_days 決定漲幅基準，
+        # 資料不足該窗時退回目前最早一根，避免把最低資料量參數誤當回看窗。
+        lookback = min(self.screen_params.return_lookback_days, len(valid_bars))
+        base_close = valid_bars[-lookback].close_price
         if base_close in {None, 0}:
             result.fail_reasons.append("近三個月基準價缺漏")
             result.passed_price = False
@@ -416,17 +515,19 @@ class StockScreener:
         if not valid_bars:
             return {w: None for w in windows_days}
 
-        # 錨點價格：anchor_date 當天或其後最近一個有收盤價的交易日
-        anchor_bars = [bar for bar in valid_bars if bar.trade_date >= anchor_date]
+        # 錨點 = 篩選日當天或其前最近一個有收盤價的交易日，與 _apply_price_filters 顯示的
+        # 「篩選日收盤價」為同一根 bar，確保報酬基準與顯示價一致（含非交易日 anchor）。
+        anchor_bars = [bar for bar in valid_bars if bar.trade_date <= anchor_date]
         if not anchor_bars:
             return {w: None for w in windows_days}
-        anchor_price = anchor_bars[0].close_price
+        anchor_bar = anchor_bars[-1]
+        anchor_price = anchor_bar.close_price
         if not anchor_price:
             return {w: None for w in windows_days}
 
         result: dict[int, float | None] = {}
         for days in windows_days:
-            target_date = anchor_date + timedelta(days=days)
+            target_date = anchor_bar.trade_date + timedelta(days=days)
             future_bars = [bar for bar in valid_bars if bar.trade_date >= target_date]
             if not future_bars:
                 result[days] = None
@@ -486,7 +587,15 @@ def build_output_frames(results: list[StockScreenResult], summary: ScreenRunSumm
     """將結果與摘要轉成適合 CLI 與 Excel 輸出的 DataFrame。"""
 
     display_rows = [_build_display_row(result) for result in results]
-    display_frame = pd.DataFrame(display_rows).sort_values(by=["是否通過篩選", "股票代號"], ascending=[False, True]) if display_rows else pd.DataFrame()
+    if display_rows:
+        display_frame = (
+            pd.DataFrame(display_rows)
+            .sort_values(by=["是否通過篩選", "_sort_score", "股票代號"], ascending=[False, False, True])
+            .drop(columns=["_sort_score"])
+            .reset_index(drop=True)
+        )
+    else:
+        display_frame = pd.DataFrame()
 
     raw_rows = [_build_raw_summary_row(result) for result in results]
     raw_rows.insert(
@@ -503,9 +612,12 @@ def build_output_frames(results: list[StockScreenResult], summary: ScreenRunSumm
             "最新收盤價": "",
             "近3個月漲幅": "",
             "距20MA": "",
+            "集保總戶數變化": "",
             "籌碼是否通過": "",
+            "集保下降是否通過": "",
             "價格是否通過": "",
             "是否通過": f"pass={summary.passed_count} fail={summary.failed_count}",
+            "選股分數": "",
             "失敗原因": "; ".join(f"{key}:{value}" for key, value in summary.failure_category_counts.items()),
             "備註": "; ".join(summary.warnings),
         },
@@ -516,7 +628,7 @@ def build_output_frames(results: list[StockScreenResult], summary: ScreenRunSumm
     fail_frame = display_frame[display_frame["是否通過篩選"] == "N"].reset_index(drop=True) if not display_frame.empty else pd.DataFrame(columns=_display_columns())
     frames: dict[str, pd.DataFrame] = {"pass": pass_frame, "fail": fail_frame, "raw_data_summary": raw_frame}
     if summary.backtest_anchor_date is not None:
-        backtest_columns = ["股票代號", "股票名稱", "市場", "篩選日收盤價", "篩選日期", "1個月後報酬率", "3個月後報酬率"]
+        backtest_columns = ["股票代號", "股票名稱", "市場", "選股分數", "評級", "篩選日收盤價", "篩選日期", "1個月後報酬率", "3個月後報酬率"]
         backtest_rows = [_build_backtest_row(result) for result in results if result.passed]
         frames["backtest"] = pd.DataFrame(backtest_rows, columns=backtest_columns)
     return frames
@@ -529,9 +641,12 @@ def _build_display_row(result: StockScreenResult) -> dict[str, Any]:
         "市場": result.market,
         "股票代號": result.code,
         "股票名稱": result.name,
+        "選股分數": "" if result.score is None else result.score,
+        "評級": result.score_label,
         "最新收盤價": "" if result.latest_close is None else round(result.latest_close, 2),
         "近3個月漲幅": format_ratio_as_pct(result.three_month_return),
         "距離20MA百分比": format_ratio_as_pct(result.distance_to_ma20),
+        "集保總戶數變化": format_ratio_as_pct(result.holder_change_ratio),
         "小於10張人數最近N週趨勢": format_trend_values(result.small_holder_trend),
         "400~800張人數最近N週趨勢": format_trend_values(result.mid_holder_trend),
         "大於1000張人數最近N週趨勢": format_trend_values(result.large_holder_trend),
@@ -539,6 +654,7 @@ def _build_display_row(result: StockScreenResult) -> dict[str, Any]:
         "不通過原因": "；".join(result.fail_reasons),
         "1個月後報酬": format_ratio_as_pct(result.forward_returns.get(30)),
         "3個月後報酬": format_ratio_as_pct(result.forward_returns.get(90)),
+        "_sort_score": result.score if result.score is not None else -1,
     }
 
 
@@ -557,9 +673,12 @@ def _build_raw_summary_row(result: StockScreenResult) -> dict[str, Any]:
         "最新收盤價": "" if result.latest_close is None else round(result.latest_close, 2),
         "近3個月漲幅": format_ratio_as_pct(result.three_month_return),
         "距20MA": format_ratio_as_pct(result.distance_to_ma20),
+        "集保總戶數變化": format_ratio_as_pct(result.holder_change_ratio),
         "籌碼是否通過": "Y" if result.passed_shareholding else "N",
+        "集保下降是否通過": "Y" if result.passed_holder_decrease else "N",
         "價格是否通過": "Y" if result.passed_price else "N",
         "是否通過": "Y" if result.passed else "N",
+        "選股分數": "" if result.score is None else result.score,
         "失敗原因": "；".join(result.fail_reasons),
         "備註": "；".join(result.source_notes),
     }
@@ -572,6 +691,8 @@ def _build_backtest_row(result: StockScreenResult) -> dict[str, Any]:
         "股票代號": result.code,
         "股票名稱": result.name,
         "市場": result.market,
+        "選股分數": result.score,
+        "評級": result.score_label,
         "篩選日收盤價": result.latest_close,
         "篩選日期": result.latest_price_date.isoformat() if result.latest_price_date else "",
         "1個月後報酬率": result.forward_returns.get(30),
@@ -585,9 +706,12 @@ def _display_columns() -> list[str]:
         "市場",
         "股票代號",
         "股票名稱",
+        "選股分數",
+        "評級",
         "最新收盤價",
         "近3個月漲幅",
         "距離20MA百分比",
+        "集保總戶數變化",
         "小於10張人數最近N週趨勢",
         "400~800張人數最近N週趨勢",
         "大於1000張人數最近N週趨勢",
