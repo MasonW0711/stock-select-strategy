@@ -20,14 +20,15 @@
 
 ## 專案檔案
 
-1. config.py：集中管理 endpoint、欄位對映、預設市場、cache 設定與評分門檻
+1. config.py：集中管理 endpoint、欄位對映、預設市場、cache 設定、抓價併發數與評分門檻；並提供 make_screen_parameters／make_cache_settings 工廠供 CLI 與 Streamlit 共用
 2. models.py：股票、股權分散快照、價格日線與摘要 dataclass
-3. api_clients.py：TWSE、TPEX、TDCC client、SSL fallback 與磁碟快取
-4. screener.py：選股主流程、趨勢判斷、集保總戶數下降、價格條件、評分與 DataFrame 輸出
-5. scoring.py：0–100 綜合評分與評級（門檻全讀自 config.py，單一真實來源）
-6. utils.py：日期、數字、股票代號與 logging 工具
-7. main.py：CLI 入口、共用執行函式、Excel 匯出（含公式注入防護）
-8. streamlit_app.py：Streamlit 互動介面（評分排序、線上趨勢圖、Excel 下載）
+3. api_clients.py：TWSE、TPEX、TDCC client、SSL fallback、磁碟快取與跨執行緒節流；TDCC 歷史含「查無資料」負快取
+4. screener.py：選股主流程、趨勢判斷、集保總戶數下降、價格條件、兩階段管線（籌碼關序列＋抓價關併發）與評分
+5. reporting.py：將篩選結果與摘要轉成 pass／fail／raw_data_summary／backtest 等輸出 DataFrame
+6. scoring.py：0–100 綜合評分與評級（門檻全讀自 config.py，單一真實來源）
+7. utils.py：日期、數字、股票代號與 logging 工具
+8. main.py：CLI 入口、共用執行函式、Excel 匯出（含公式注入防護）
+9. streamlit_app.py：Streamlit 互動介面（評分排序、線上趨勢圖、Excel 下載）
 
 ## 安裝步驟
 
@@ -118,6 +119,12 @@ python3 main.py --weeks 4 --max-3m-return 0.35 --max-distance-to-ma 0.06 --stock
 python3 main.py --disable-cache
 ```
 
+1. 調整抓價併發數（1＝純序列；>1 會先序列跑籌碼關、再併發抓價，明顯加速全市場掃描）
+
+```bash
+python3 main.py --price-workers 8
+```
+
 1. 指定 Excel 輸出檔名
 
 ```bash
@@ -174,6 +181,11 @@ streamlit run streamlit_app.py
 
 評分結果同時提供「選股分數」與「評級」欄位，pass 清單預設依分數由高到低排序。
 
+評分語意補充：
+
+1. 大戶人數增幅、集保總戶數降幅屬「方向訊號」，數值 ≤ 0（零成長或反向，例如關閉硬性過濾時集保戶數其實在增加）一律 0 分，不給地板分
+2. 近三月漲幅維度將溫和或小幅負報酬視為高分，但跌幅深於門檻（預設 −30%）視為弱勢、直接 0 分，避免崩跌股反而拿滿分
+
 ## TDCC 分級換算說明
 
 TDCC 官方分級不是每一張都切得很細，因此程式採用 metadata 聚合方式：
@@ -193,8 +205,10 @@ TDCC 官方分級不是每一張都切得很細，因此程式採用 metadata �
 
 1. 公司清單、最新 TDCC 快照、TWSE 月資料、TPEX 月資料會寫入 .cache 目錄
 2. TDCC 歷史週資料會依 股票代號 + 日期 做磁碟快取，重跑時不必再次查詢官方頁面
-3. TDCC 歷史查詢會重用結果頁中的新 token，避免每一筆都先重新載入查詢首頁
-4. 只有籌碼條件先通過的股票，才會往下抓價格資料
+3. TDCC 歷史「查無資料」會寫入負快取（預設 1 天），避免每次（尤其回測）對下市／當期無資料股票重打查詢頁
+4. TDCC 歷史查詢會重用結果頁中的新 token，避免每一筆都先重新載入查詢首頁
+5. 只有籌碼條件先通過的股票，才會往下抓價格資料
+6. 抓價階段可併發（--price-workers / Streamlit「抓價併發數」）；跨執行緒仍以最低請求間隔節流，兼顧速度與禮貌
 
 ## 輸出內容
 
@@ -210,7 +224,7 @@ Excel 檔預設包含三個工作表（皆含「選股分數」「評級」「�
 
 1. pass：通過的股票（依選股分數由高到低排序）
 2. fail：未通過的股票
-3. raw_data_summary：每檔股票的資料完整度、TDCC 週數、價格天數、各關卡是否通過與失敗原因
+3. raw_data_summary：每檔股票的資料完整度、TDCC 週數、價格天數、各關卡是否通過與失敗原因；價格區間若含疑似除權息／減資的大跳空（單日逾約 11%），會在「備註」標註，提醒此處價格未還原、均線與報酬可能失真
 
 若使用回測模式，會額外加入：
 

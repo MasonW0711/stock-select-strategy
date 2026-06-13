@@ -4,7 +4,8 @@ from api_clients import ApiClientError, TWSEApiClient
 from config import DEFAULT_CACHE_SETTINGS, DEFAULT_HTTP_SETTINGS, DEFAULT_SCREEN_PARAMETERS
 from config import DEFAULT_SCREEN_PARAMETERS
 from models import PriceBar, ScreenRunSummary, ShareholdingSnapshot, StockInfo, StockScreenResult
-from screener import StockScreener, build_output_frames
+from reporting import build_output_frames
+from screener import StockScreener
 
 
 def _make_screener():

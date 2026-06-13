@@ -6,7 +6,16 @@ import pandas as pd
 import streamlit as st
 
 from api_clients import ApiClientError
-from config import DEFAULT_CACHE_SETTINGS, DEFAULT_MARKETS, DEFAULT_SCREEN_PARAMETERS, MARKET_LABELS, CacheSettings, ScreenParameters
+from config import (
+    DEFAULT_HTTP_SETTINGS,
+    DEFAULT_MARKETS,
+    DEFAULT_SCREEN_PARAMETERS,
+    MARKET_LABELS,
+    CacheSettings,
+    ScreenParameters,
+    make_cache_settings,
+    make_screen_parameters,
+)
 from main import build_summary_text, execute_screening, frames_to_excel_bytes, resolve_output_path
 from utils import setup_logging, format_ratio_as_pct
 
@@ -110,19 +119,14 @@ def _build_screen_parameters(
     holder_decrease_weeks: int,
     min_holder_decrease_ratio: float,
 ) -> ScreenParameters:
-    """依 Streamlit 表單輸入建立篩選參數。"""
+    """依 Streamlit 表單輸入建立篩選參數（建構與 clamp 委派給 config.make_screen_parameters）。"""
 
-    return ScreenParameters(
+    return make_screen_parameters(
         consecutive_weeks=weeks,
         max_3m_return=max_3m_return,
-        ma_window=DEFAULT_SCREEN_PARAMETERS.ma_window,
         max_distance_to_ma=max_distance_to_ma,
-        min_history_weeks=max(weeks, DEFAULT_SCREEN_PARAMETERS.min_history_weeks),
         min_price_days=min_price_days,
-        price_history_months=max(price_history_months, 1),
-        tdcc_date_buffer_weeks=DEFAULT_SCREEN_PARAMETERS.tdcc_date_buffer_weeks,
-        trend_mode=DEFAULT_SCREEN_PARAMETERS.trend_mode,
-        return_lookback_days=DEFAULT_SCREEN_PARAMETERS.return_lookback_days,
+        price_history_months=price_history_months,
         require_holder_decrease=require_holder_decrease,
         holder_decrease_weeks=holder_decrease_weeks,
         min_holder_decrease_ratio=min_holder_decrease_ratio,
@@ -171,17 +175,9 @@ def _trend_to_frame(dates: list[str], series_map: dict[str, list]) -> pd.DataFra
 
 
 def _build_cache_settings(enabled: bool) -> CacheSettings:
-    """建立 Streamlit 執行使用的快取設定。"""
+    """建立 Streamlit 執行使用的快取設定（委派給 config.make_cache_settings）。"""
 
-    return CacheSettings(
-        enabled=enabled,
-        cache_dir=DEFAULT_CACHE_SETTINGS.cache_dir,
-        universe_ttl_seconds=DEFAULT_CACHE_SETTINGS.universe_ttl_seconds,
-        latest_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.latest_snapshot_ttl_seconds,
-        tdcc_dates_ttl_seconds=DEFAULT_CACHE_SETTINGS.tdcc_dates_ttl_seconds,
-        price_ttl_seconds=DEFAULT_CACHE_SETTINGS.price_ttl_seconds,
-        historical_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.historical_snapshot_ttl_seconds,
-    )
+    return make_cache_settings(enabled=enabled)
 
 
 st.markdown(
@@ -247,6 +243,10 @@ with st.sidebar:
         else:
             st.caption("若要看策略回測，請先勾選上方的「啟用回測驗證」。")
         enable_cache = st.checkbox("啟用磁碟快取", value=True)
+        price_workers = st.slider(
+            "抓價併發數", min_value=1, max_value=12, value=DEFAULT_HTTP_SETTINGS.price_fetch_workers,
+            help="1＝純序列；>1 會先序列跑籌碼關、再併發抓價，明顯加速全市場掃描",
+        )
         log_level = st.selectbox("Log 等級", options=["INFO", "DEBUG"], index=0)
         submitted = st.form_submit_button("開始回測驗證" if enable_backtest else "開始篩選", use_container_width=True)
 
@@ -278,6 +278,7 @@ if submitted:
                     markets=tuple(selected_markets),
                     cache_settings=cache_settings,
                     start_date=backtest_date,
+                    price_fetch_workers=int(price_workers),
                 )
                 excel_bytes = frames_to_excel_bytes(frames)
                 download_name = resolve_output_path("").name
@@ -329,7 +330,7 @@ if run_result:
     summary_lines = "".join(f"<li>{line}</li>" for line in build_summary_text(summary))
     st.markdown(f'<div class="summary-panel"><strong>執行摘要</strong><ul>{summary_lines}</ul></div>', unsafe_allow_html=True)
 
-    has_backtest = getattr(summary, "backtest_anchor_date", None) is not None
+    has_backtest = summary.backtest_anchor_date is not None
     tab_labels = ["通過清單", "未通過清單", "原始摘要"]
     if has_backtest:
         tab_labels.append("回測績效驗證")
@@ -345,11 +346,11 @@ if run_result:
     if has_backtest:
         with tabs[3]:
             bt_frame = frames["backtest"]
-            anchor_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else "?"
-            tdcc_anchor_date = getattr(summary, "backtest_tdcc_anchor_date", None)
+            anchor_date_str = summary.backtest_anchor_date.isoformat() if summary.backtest_anchor_date else "?"
+            tdcc_anchor_date = summary.backtest_tdcc_anchor_date
             tdcc_anchor_str = tdcc_anchor_date.isoformat() if tdcc_anchor_date else "?"
             st.markdown(f"**篩選日期：{anchor_date_str}**　**TDCC 對齊週別：{tdcc_anchor_str}**　共 {len(bt_frame)} 檔通過篩選")
-            if tdcc_anchor_date is not None and tdcc_anchor_date != getattr(summary, "backtest_anchor_date", None):
+            if tdcc_anchor_date is not None and tdcc_anchor_date != summary.backtest_anchor_date:
                 st.caption("已使用小於等於指定日期的最近 TDCC 週資料做籌碼篩選；價格條件與後續報酬仍以你選的日期為準。")
             st.caption("⚠️ 本回測會先依上市/上櫃日期排除當時尚未可交易股票，但仍以今日可取得的公司清單為基底；已下市或代號變更股票可能無法抓到歷史資料。")
 

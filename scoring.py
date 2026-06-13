@@ -5,6 +5,7 @@ from config import (
     SCORE_LABEL_THRESHOLDS,
     SCORE_LARGE_HOLDER_GROWTH,
     SCORE_MA_PROXIMITY,
+    SCORE_RETURN_DEEP_DROP,
     SCORE_RETURN_MILDNESS,
 )
 
@@ -12,9 +13,13 @@ ScoreTable = tuple[tuple[float, int], ...]
 
 
 def _score_at_least(value: float | None, table: ScoreTable) -> int:
-    """越大越好：回傳第一個 value >= 門檻 的分數，table 由高門檻往低排列。"""
+    """越大越好且必須為正：回傳第一個 value >= 門檻 的分數，table 由高門檻往低排列。
 
-    if value is None:
+    value <= 0 一律 0 分：這些維度（大戶增幅、集保降幅）代表「方向訊號」，
+    零成長或反向（例如關閉硬性過濾時集保戶數其實在增加）不應領到地板分。
+    """
+
+    if value is None or value <= 0:
         return 0
     for threshold, points in table:
         if value >= threshold:
@@ -52,8 +57,14 @@ def score_ma_proximity(distance_to_ma: float | None) -> int:
 
 
 def score_return_mildness(three_month_return: float | None) -> int:
-    """近三月漲幅溫和度評分；負報酬視為最溫和、得最高分。"""
+    """近三月漲幅溫和度評分；小幅或溫和負報酬視為溫和、得高分。
 
+    但深跌（跌幅超過 SCORE_RETURN_DEEP_DROP）屬於弱勢/可能基本面有事，
+    並非「仍有上行空間」，故直接 0 分，避免崩跌股反而拿滿分。
+    """
+
+    if three_month_return is not None and three_month_return < SCORE_RETURN_DEEP_DROP:
+        return 0
     return _score_at_most(three_month_return, SCORE_RETURN_MILDNESS)
 
 

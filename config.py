@@ -37,6 +37,9 @@ class HttpSettings:
     max_retries: int = 3
     backoff_seconds: float = 1.2
     min_interval_seconds: float = 0.2
+    # 抓價階段的併發數（>1 時 run_screening 會「先序列跑籌碼關、再併發抓價」）。
+    # 跨執行緒節流仍以 min_interval_seconds 控制單一 client 的最低請求間隔，兼顧速度與禮貌。
+    price_fetch_workers: int = 4
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,10 @@ class ScreenParameters:
     max_distance_to_ma: float = 0.08
     min_history_weeks: int = 3
     min_price_days: int = 60
-    price_history_months: int = 4
+    # 預設 6 個月：min_price_days 與 return_lookback_days 皆為 60 個交易日，
+    # 4 個月（約 80 交易日）在農曆年等假期密集月份容易逼近門檻而誤判「價格資料不足」，
+    # 故拉高預設並於 screener 內依「所需交易日數」反推下限（兩者取大）。
+    price_history_months: int = 6
     tdcc_date_buffer_weeks: int = 6
     trend_mode: Literal["strict"] = "strict"
     # 近 N 個交易日報酬回看窗，與 min_price_days（最低資料量）解耦
@@ -71,11 +77,64 @@ class CacheSettings:
     tdcc_dates_ttl_seconds: int = 6 * 60 * 60
     price_ttl_seconds: int = 24 * 60 * 60
     historical_snapshot_ttl_seconds: int = 30 * 24 * 60 * 60
+    # TDCC 歷史「查無資料」負快取 TTL：避免每次（尤其回測）對下市/當期無資料股票重打查詢頁；
+    # 設 1 天而非永久，是為了能從官方站台暫時性異常中自動恢復。
+    tdcc_not_found_ttl_seconds: int = 24 * 60 * 60
 
 
 DEFAULT_HTTP_SETTINGS = HttpSettings()
 DEFAULT_SCREEN_PARAMETERS = ScreenParameters()
 DEFAULT_CACHE_SETTINGS = CacheSettings()
+
+
+def make_screen_parameters(
+    *,
+    consecutive_weeks: int = DEFAULT_SCREEN_PARAMETERS.consecutive_weeks,
+    max_3m_return: float = DEFAULT_SCREEN_PARAMETERS.max_3m_return,
+    max_distance_to_ma: float = DEFAULT_SCREEN_PARAMETERS.max_distance_to_ma,
+    min_price_days: int = DEFAULT_SCREEN_PARAMETERS.min_price_days,
+    price_history_months: int = DEFAULT_SCREEN_PARAMETERS.price_history_months,
+    return_lookback_days: int = DEFAULT_SCREEN_PARAMETERS.return_lookback_days,
+    require_holder_decrease: bool = DEFAULT_SCREEN_PARAMETERS.require_holder_decrease,
+    holder_decrease_weeks: int = DEFAULT_SCREEN_PARAMETERS.holder_decrease_weeks,
+    min_holder_decrease_ratio: float = DEFAULT_SCREEN_PARAMETERS.min_holder_decrease_ratio,
+) -> "ScreenParameters":
+    """集中建構 ScreenParameters，把各輸入的下限/clamp 收斂到單一真實來源，供 CLI 與 Streamlit 共用。"""
+
+    return ScreenParameters(
+        consecutive_weeks=consecutive_weeks,
+        max_3m_return=max_3m_return,
+        ma_window=DEFAULT_SCREEN_PARAMETERS.ma_window,
+        max_distance_to_ma=max_distance_to_ma,
+        min_history_weeks=max(consecutive_weeks, DEFAULT_SCREEN_PARAMETERS.min_history_weeks),
+        min_price_days=min_price_days,
+        price_history_months=max(price_history_months, 1),
+        tdcc_date_buffer_weeks=DEFAULT_SCREEN_PARAMETERS.tdcc_date_buffer_weeks,
+        trend_mode=DEFAULT_SCREEN_PARAMETERS.trend_mode,
+        return_lookback_days=max(return_lookback_days, 1),
+        require_holder_decrease=require_holder_decrease,
+        holder_decrease_weeks=max(holder_decrease_weeks, 1),
+        min_holder_decrease_ratio=max(min_holder_decrease_ratio, 0.0),
+    )
+
+
+def make_cache_settings(
+    *,
+    enabled: bool = DEFAULT_CACHE_SETTINGS.enabled,
+    cache_dir: str = DEFAULT_CACHE_SETTINGS.cache_dir,
+) -> "CacheSettings":
+    """集中建構 CacheSettings（TTL 一律沿用預設），供 CLI 與 Streamlit 共用。"""
+
+    return CacheSettings(
+        enabled=enabled,
+        cache_dir=cache_dir,
+        universe_ttl_seconds=DEFAULT_CACHE_SETTINGS.universe_ttl_seconds,
+        latest_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.latest_snapshot_ttl_seconds,
+        tdcc_dates_ttl_seconds=DEFAULT_CACHE_SETTINGS.tdcc_dates_ttl_seconds,
+        price_ttl_seconds=DEFAULT_CACHE_SETTINGS.price_ttl_seconds,
+        historical_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.historical_snapshot_ttl_seconds,
+        tdcc_not_found_ttl_seconds=DEFAULT_CACHE_SETTINGS.tdcc_not_found_ttl_seconds,
+    )
 
 TDCC_BUCKET_DEFINITIONS = (
     {"bucket_id": 1, "label": "1-999", "min_shares": 1, "max_shares": 999, "is_adjustment": False, "is_total": False},
@@ -168,6 +227,12 @@ SCORE_HOLDER_DECLINE = ((0.05, 25), (0.03, 20), (0.01, 15), (0.0, 10))
 SCORE_MA_PROXIMITY = ((0.02, 25), (0.04, 20), (0.06, 15), (0.08, 10))
 # 近三月漲幅（ratio，越溫和越好；門檻為「不超過」）→ 分數
 SCORE_RETURN_MILDNESS = ((0.10, 20), (0.20, 15), (0.30, 10), (0.40, 5))
+# 近三月跌幅深於此門檻者視為弱勢，不再給「漲幅溫和」分（直接 0）。
+SCORE_RETURN_DEEP_DROP = -0.30
 
 # 綜合分數的評級標籤門檻（分數 >= 門檻 即套用該標籤，由高往低）
 SCORE_LABEL_THRESHOLDS = ((85, "⭐⭐⭐ 強力推薦"), (70, "⭐⭐ 值得關注"), (55, "⭐ 符合條件"), (0, "基本符合"))
+
+# 單日價格跳空警示門檻：台股一般單日漲跌幅上限約 10%，超過 11% 幾乎只可能來自
+# 除權息/減資等公司行動。由於本專案使用未還原價，命中時於 source_notes 標註（不強制淘汰）。
+PRICE_DISCONTINUITY_ALERT_RATIO = 0.11
