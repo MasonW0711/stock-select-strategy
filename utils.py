@@ -8,13 +8,21 @@ from typing import Any, Iterable
 
 
 def setup_logging(level: str = "INFO") -> logging.Logger:
-    """建立全域 logging 設定並回傳根 logger。"""
+    """建立全域 logging 設定並回傳專案 logger。
 
+    basicConfig 只有第一次（root 尚無 handler 時）會掛上 handler，但每次呼叫都會
+    重設 level，使 Streamlit rerun 或 CLI 改 log 等級時能即時生效（避免只有第一次有效）。
+    """
+
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=resolved_level,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    return logging.getLogger("stock_screener")
+    logging.getLogger().setLevel(resolved_level)
+    logger = logging.getLogger("stock_screener")
+    logger.setLevel(resolved_level)
+    return logger
 
 
 def strip_bom(value: str) -> str:

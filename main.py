@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from io import BytesIO
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
-from api_clients import TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
+from api_clients import AccessBlockedError, ApiClientError, TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
 from config import (
     DEFAULT_CACHE_SETTINGS,
     DEFAULT_HTTP_SETTINGS,
@@ -16,8 +17,12 @@ from config import (
     DEFAULT_SCREEN_PARAMETERS,
     CacheSettings,
     ScreenParameters,
+    make_cache_settings,
+    make_screen_parameters,
 )
-from screener import StockScreener, build_output_frames
+from models import ScreenRunSummary, StockScreenResult
+from reporting import build_output_frames
+from screener import StockScreener
 from utils import setup_logging, parse_tdcc_or_twse_date
 
 
@@ -30,8 +35,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-3m-return", type=float, default=DEFAULT_SCREEN_PARAMETERS.max_3m_return, help="近三個月最大漲幅上限，例如 0.4")
     parser.add_argument("--max-distance-to-ma", type=float, default=DEFAULT_SCREEN_PARAMETERS.max_distance_to_ma, help="距離 20MA 最大允許比例，例如 0.08")
     parser.add_argument("--min-price-days", type=int, default=DEFAULT_SCREEN_PARAMETERS.min_price_days, help="最低價格資料日數")
+    parser.add_argument("--return-lookback-days", type=int, default=DEFAULT_SCREEN_PARAMETERS.return_lookback_days, help="近三月漲幅回看的交易日數（與最低資料量解耦）")
     parser.add_argument("--price-history-months", type=int, default=DEFAULT_SCREEN_PARAMETERS.price_history_months, help="往回抓取 TWSE 月資料的月份數")
+    parser.add_argument("--holder-decrease-weeks", type=int, default=DEFAULT_SCREEN_PARAMETERS.holder_decrease_weeks, help="集保總戶數比較的週距（最新 vs N 週前）")
+    parser.add_argument("--min-holder-decrease", type=float, default=DEFAULT_SCREEN_PARAMETERS.min_holder_decrease_ratio, help="集保總戶數最小下降比例，例如 0.03 表示需下降 3%%")
+    parser.add_argument("--no-holder-decrease", action="store_true", help="停用集保總戶數下降的硬性過濾（仍會計入評分）")
     parser.add_argument("--markets", type=str, default=",".join(DEFAULT_MARKETS), help="市場範圍，例如 listed,otc 或 listed")
+    parser.add_argument(
+        "--price-workers",
+        type=int,
+        default=DEFAULT_HTTP_SETTINGS.price_fetch_workers,
+        help="抓價併發數（>1：先序列跑籌碼關、再併發抓價；1＝純序列）",
+    )
     parser.add_argument("--disable-cache", action="store_true", help="停用本地磁碟快取")
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_SETTINGS.cache_dir, help="指定快取資料夾路徑")
     parser.add_argument("--log-level", type=str, default="INFO", help="logging level，例如 INFO 或 DEBUG")
@@ -46,44 +61,52 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def build_screen_parameters(args: argparse.Namespace) -> ScreenParameters:
-    """依 CLI 參數覆寫預設選股設定。"""
+    """依 CLI 參數覆寫預設選股設定（建構與 clamp 邏輯委派給 config.make_screen_parameters）。"""
 
-    return ScreenParameters(
+    return make_screen_parameters(
         consecutive_weeks=args.weeks,
         max_3m_return=args.max_3m_return,
-        ma_window=DEFAULT_SCREEN_PARAMETERS.ma_window,
         max_distance_to_ma=args.max_distance_to_ma,
-        min_history_weeks=max(args.weeks, DEFAULT_SCREEN_PARAMETERS.min_history_weeks),
         min_price_days=args.min_price_days,
-        price_history_months=max(args.price_history_months, 1),
-        tdcc_date_buffer_weeks=DEFAULT_SCREEN_PARAMETERS.tdcc_date_buffer_weeks,
-        trend_mode=DEFAULT_SCREEN_PARAMETERS.trend_mode,
+        price_history_months=args.price_history_months,
+        return_lookback_days=args.return_lookback_days,
+        require_holder_decrease=not args.no_holder_decrease,
+        holder_decrease_weeks=args.holder_decrease_weeks,
+        min_holder_decrease_ratio=args.min_holder_decrease,
     )
 
 
 def parse_markets(markets_argument: str) -> tuple[str, ...]:
-    """將 markets 字串轉成標準市場代號序列。"""
+    """將 markets 字串轉成標準市場代號序列。
 
-    normalized = [value.strip().lower() for value in markets_argument.split(",") if value.strip()]
-    resolved = [value for value in normalized if value in {"listed", "otc"}]
-    return tuple(dict.fromkeys(resolved)) or DEFAULT_MARKETS
+    - 完全沒給內容（空字串/全空白）→ 回退預設市場。
+    - 有給內容但沒有任何合法市場（例如打錯成 foo）→ 丟 ValueError，不靜默回退，
+      避免使用者誤以為只跑某市場、實際卻跑了全部。
+    """
+
+    valid_markets = {"listed", "otc"}
+    tokens = [value.strip().lower() for value in markets_argument.split(",") if value.strip()]
+    if not tokens:
+        return DEFAULT_MARKETS
+    resolved = [value for value in tokens if value in valid_markets]
+    if not resolved:
+        raise ValueError(f"無效的市場參數：{markets_argument!r}；可用值為 {', '.join(sorted(valid_markets))}")
+    return tuple(dict.fromkeys(resolved))
 
 
 def build_cache_settings(args: argparse.Namespace) -> CacheSettings:
-    """依 CLI 參數建立 cache 設定。"""
+    """依 CLI 參數建立 cache 設定（委派給 config.make_cache_settings）。"""
 
-    return CacheSettings(
-        enabled=not args.disable_cache,
-        cache_dir=args.cache_dir,
-        universe_ttl_seconds=DEFAULT_CACHE_SETTINGS.universe_ttl_seconds,
-        latest_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.latest_snapshot_ttl_seconds,
-        tdcc_dates_ttl_seconds=DEFAULT_CACHE_SETTINGS.tdcc_dates_ttl_seconds,
-        price_ttl_seconds=DEFAULT_CACHE_SETTINGS.price_ttl_seconds,
-        historical_snapshot_ttl_seconds=DEFAULT_CACHE_SETTINGS.historical_snapshot_ttl_seconds,
-    )
+    return make_cache_settings(enabled=not args.disable_cache, cache_dir=args.cache_dir)
 
 
-def build_screener(screen_parameters: ScreenParameters, logger: object, cache_settings: CacheSettings, markets: tuple[str, ...]) -> StockScreener:
+def build_screener(
+    screen_parameters: ScreenParameters,
+    logger: logging.Logger,
+    cache_settings: CacheSettings,
+    markets: tuple[str, ...],
+    price_fetch_workers: int = DEFAULT_HTTP_SETTINGS.price_fetch_workers,
+) -> StockScreener:
     """建立本次執行要使用的 screener 與各 market client。"""
 
     tdcc_latest_client = TDCCOpenApiClient(http_settings=DEFAULT_HTTP_SETTINGS, cache_settings=cache_settings, logger=logger)
@@ -97,17 +120,19 @@ def build_screener(screen_parameters: ScreenParameters, logger: object, cache_se
         tpex_client=tpex_client,
         screen_params=screen_parameters,
         logger=logger,
+        price_fetch_workers=price_fetch_workers,
     )
 
 
 def execute_screening(
     screen_parameters: ScreenParameters,
-    logger: object,
+    logger: logging.Logger,
     stock_limit: int | None,
     markets: tuple[str, ...],
     cache_settings: CacheSettings,
     start_date: date | None = None,
-) -> tuple[list[object], object, dict[str, pd.DataFrame]]:
+    price_fetch_workers: int = DEFAULT_HTTP_SETTINGS.price_fetch_workers,
+) -> tuple[list[StockScreenResult], ScreenRunSummary, dict[str, pd.DataFrame]]:
     """執行一次完整篩選並回傳結果、摘要與輸出 frames。"""
 
     screener = build_screener(
@@ -115,6 +140,7 @@ def execute_screening(
         logger=logger,
         cache_settings=cache_settings,
         markets=markets,
+        price_fetch_workers=price_fetch_workers,
     )
     results, summary = screener.run_screening(stock_limit=stock_limit, markets=markets, start_date=start_date)
     frames = build_output_frames(results=results, summary=summary)
@@ -131,12 +157,12 @@ def print_terminal_output(frames: dict[str, pd.DataFrame], summary_text: list[st
     print(frames["fail"].to_string(index=False) if not frames["fail"].empty else "無失敗股票")
 
 
-def build_summary_text(summary: object) -> list[str]:
+def build_summary_text(summary: ScreenRunSummary) -> list[str]:
     """將執行摘要整理成終端機可讀文字。"""
 
-    market_counts = "、".join(f"{market}:{count}" for market, count in summary.market_counts.items()) if getattr(summary, "market_counts", None) else "無"
-    start_date_str = summary.backtest_anchor_date.isoformat() if getattr(summary, "backtest_anchor_date", None) else ""
-    tdcc_anchor_str = summary.backtest_tdcc_anchor_date.isoformat() if getattr(summary, "backtest_tdcc_anchor_date", None) else ""
+    market_counts = "、".join(f"{market}:{count}" for market, count in summary.market_counts.items()) if summary.market_counts else "無"
+    start_date_str = summary.backtest_anchor_date.isoformat() if summary.backtest_anchor_date else ""
+    tdcc_anchor_str = summary.backtest_tdcc_anchor_date.isoformat() if summary.backtest_tdcc_anchor_date else ""
 
     return [
         f"執行時間：{summary.run_timestamp.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -166,13 +192,27 @@ def resolve_output_path(output_argument: str) -> Path:
     return Path.cwd() / f"{DEFAULT_OUTPUT_BASENAME}_{date.today():%Y%m%d}.xlsx"
 
 
+def _excel_safe_cell(value: object) -> object:
+    """防 Excel 公式注入：對以 =、@、或 +/- 後接非數字開頭的字串前置單引號。
+
+    `-3.21%` 這類合法負數/百分比字串（- 後接數字）不會被改動。
+    """
+
+    if isinstance(value, str) and value:
+        first = value[0]
+        if first in ("=", "@") or (first in ("+", "-") and len(value) > 1 and not value[1].isdigit()):
+            return "'" + value
+    return value
+
+
 def frames_to_excel_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
-    """將 pass、fail、raw_data_summary 轉成 xlsx bytes。"""
+    """將 pass、fail、raw_data_summary 轉成 xlsx bytes（含公式注入防護）。"""
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for sheet_name, frame in frames.items():
-            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            safe_frame = frame.map(_excel_safe_cell) if not frame.empty else frame
+            safe_frame.to_excel(writer, sheet_name=sheet_name, index=False)
     return buffer.getvalue()
 
 
@@ -191,18 +231,31 @@ def main() -> int:
     logger = setup_logging(args.log_level)
 
     screen_parameters = build_screen_parameters(args)
-    markets = parse_markets(args.markets)
+    try:
+        markets = parse_markets(args.markets)
+    except ValueError as exc:
+        parser.error(str(exc))
     cache_settings = build_cache_settings(args)
     start_date = parse_tdcc_or_twse_date(args.start_date) if args.start_date else None
 
-    _, summary, frames = execute_screening(
-        screen_parameters=screen_parameters,
-        logger=logger,
-        stock_limit=args.stock_limit,
-        markets=markets,
-        cache_settings=cache_settings,
-        start_date=start_date,
-    )
+    try:
+        _, summary, frames = execute_screening(
+            screen_parameters=screen_parameters,
+            logger=logger,
+            stock_limit=args.stock_limit,
+            markets=markets,
+            cache_settings=cache_settings,
+            start_date=start_date,
+            price_fetch_workers=max(args.price_workers, 1),
+        )
+    except AccessBlockedError as exc:
+        print(f"\n[錯誤] 官方資料站台拒絕此主機請求（很可能是雲端/資料中心 IP 被阻擋）：\n{exc}")
+        print("建議：改在本機執行，或設定 HTTPS_PROXY 環境變數改由未被封鎖的出口 IP 連線。")
+        return 2
+    except ApiClientError as exc:
+        print(f"\n[錯誤] 官方資料來源回應異常，已中止：{exc}")
+        print("建議：稍後重試，或先用 --stock-limit 縮小範圍觀察 --log-level DEBUG。")
+        return 1
     print_terminal_output(frames=frames, summary_text=build_summary_text(summary))
 
     output_path = resolve_output_path(args.output)

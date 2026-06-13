@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections import defaultdict
 from datetime import date
@@ -53,6 +54,18 @@ class DataNotFoundError(ApiClientError):
     """代表資料來源回應成功，但沒有找到目標資料。"""
 
 
+class AccessBlockedError(ApiClientError):
+    """官方站台以 WAF／安全頁（HTTP 200 但內容為封鎖訊息）拒絕請求。
+
+    常見於 Streamlit Cloud 等雲端/資料中心 IP 被 TWSE/TPEX/TDCC 阻擋；非程式錯誤，
+    且重試同一 IP 無效，故獨立成型別讓上層能給出明確、可行動的提示。
+    """
+
+
+# 官方安全頁的特徵字串（英文標記為 ASCII，編碼異常時仍可比對）。
+ACCESS_BLOCK_MARKERS = ("FOR SECURITY REASONS", "THIS PAGE CAN NOT BE ACCESSED", "因為安全性考量")
+
+
 class BaseHttpClient:
     """提供 requests.Session、retry 與簡單 rate limit 的基底 client。"""
 
@@ -69,7 +82,10 @@ class BaseHttpClient:
         self.logger = logger or logging.getLogger("stock_screener")
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
-        self._last_request_at = 0.0
+        # 跨執行緒節流：以「下一個可送出時刻」配額排程，threads 之間互相錯開最低請求間隔，
+        # 但 sleep 不在鎖內進行，因此併發抓價時網路等待可重疊（吞吐受 min_interval 上限保護）。
+        self._rate_lock = threading.Lock()
+        self._next_allowed_at = 0.0
         self._cache_root = Path(self.cache_settings.cache_dir).expanduser().resolve()
         self._ssl_fallback_warned_hosts: set[str] = set()
         self._ssl_fallback_hosts = {
@@ -95,7 +111,6 @@ class BaseHttpClient:
                 self._sleep_before_retry(attempt, f"網路錯誤，準備重試：{url}")
                 continue
 
-            self._last_request_at = time.monotonic()
             if response.status_code == 404:
                 raise DataNotFoundError(f"找不到資料：{url}")
             if response.status_code == 429 or response.status_code >= 500:
@@ -107,9 +122,23 @@ class BaseHttpClient:
                 raise ApiClientError(f"請求失敗：{url} ({response.status_code})")
 
             response.encoding = response.apparent_encoding or response.encoding
+            self._raise_if_access_blocked(url, response)
             return response
 
         raise ApiClientError(f"請求失敗：{url}")
+
+    def _raise_if_access_blocked(self, url: str, response: requests.Response) -> None:
+        """偵測官方 WAF／安全頁（200 但內容為封鎖訊息）；命中即丟 AccessBlockedError，不重試。"""
+
+        content_type = normalize_text(response.headers.get("Content-Type")).lower()
+        if "html" not in content_type:
+            return
+        body_preview = response.text[:1000]
+        if any(marker in body_preview for marker in ACCESS_BLOCK_MARKERS):
+            self.logger.error("資料來源以安全頁拒絕此主機請求（疑似雲端/資料中心 IP 被阻擋）：%s", url)
+            raise AccessBlockedError(
+                f"官方資料站台以安全頁拒絕此主機的請求（很可能是雲端/資料中心 IP 被阻擋）：{url}"
+            )
 
     def _request_with_ssl_fallback(
         self,
@@ -266,12 +295,19 @@ class BaseHttpClient:
             self.logger.debug("寫入快取失敗：%s", cache_path)
 
     def _respect_rate_limit(self) -> None:
-        """確保兩次請求之間至少留出最小間隔。"""
+        """確保（跨執行緒）兩次請求之間至少留出最小間隔。
 
-        elapsed = time.monotonic() - self._last_request_at
-        sleep_seconds = self.http_settings.min_interval_seconds - elapsed
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+        在鎖內僅計算等待時間並預約下一個時槽，sleep 留到鎖外執行，使併發抓價時各 thread
+        能錯開送出、重疊網路等待，同時把單一 client 的吞吐限制在 1/min_interval 以內。
+        """
+
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_seconds = self._next_allowed_at - now
+            slot_start = now if wait_seconds <= 0 else self._next_allowed_at
+            self._next_allowed_at = slot_start + self.http_settings.min_interval_seconds
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
 
     def _sleep_before_retry(self, attempt: int, message: str) -> None:
         """依 retry 次數進行指數退避。"""
@@ -363,6 +399,36 @@ class TDCCPortalHistoryClient(BaseHttpClient):
         self._form_state: dict[str, str] | None = None
         self._available_dates: list[date] | None = None
         self._snapshot_cache: dict[tuple[str, date], ShareholdingSnapshot] = {}
+        # 負快取：記住本次執行已確認「查無資料」的 (股票, 日期)，避免同一輪重複查詢。
+        self._not_found_cache: set[tuple[str, date]] = set()
+
+    _NOT_FOUND_NAMESPACE = "tdcc_history_notfound"
+    _NOT_FOUND_MARKER = "__TDCC_NOT_FOUND__"
+
+    def _load_not_found(self, stock_code: str, query_date: date, disk_cache_key: str) -> bool:
+        """檢查記憶體與磁碟負快取是否已記錄此股票該週查無資料。"""
+
+        if (stock_code, query_date) in self._not_found_cache:
+            return True
+        cached = self._load_cache_text(
+            namespace=self._NOT_FOUND_NAMESPACE,
+            cache_key=disk_cache_key,
+            max_age_seconds=self.cache_settings.tdcc_not_found_ttl_seconds,
+        )
+        if cached == self._NOT_FOUND_MARKER:
+            self._not_found_cache.add((stock_code, query_date))
+            return True
+        return False
+
+    def _save_not_found(self, stock_code: str, query_date: date, disk_cache_key: str) -> None:
+        """將「查無資料」寫入記憶體與磁碟負快取。"""
+
+        self._not_found_cache.add((stock_code, query_date))
+        self._save_cache_text(
+            namespace=self._NOT_FOUND_NAMESPACE,
+            cache_key=disk_cache_key,
+            text=self._NOT_FOUND_MARKER,
+        )
 
     def refresh_form_state(self) -> None:
         """重新抓取查詢頁 hidden token 與可選日期。"""
@@ -425,6 +491,9 @@ class TDCCPortalHistoryClient(BaseHttpClient):
             self._snapshot_cache[cache_key] = snapshot
             return snapshot
 
+        if self._load_not_found(stock_code=stock_code, query_date=query_date, disk_cache_key=disk_cache_key):
+            raise DataNotFoundError(f"TDCC 查無資料（負快取）：{stock_code} {query_date.isoformat()}")
+
         available_dates = self.get_available_dates()
         if query_date not in available_dates:
             raise DataNotFoundError(f"TDCC 查詢頁沒有提供日期：{query_date.isoformat()}")
@@ -457,6 +526,8 @@ class TDCCPortalHistoryClient(BaseHttpClient):
                 self._snapshot_cache[cache_key] = snapshot
                 return snapshot
             except DataNotFoundError:
+                # 確認查無資料：寫入負快取，避免之後（尤其回測）重複打官方查詢頁。
+                self._save_not_found(stock_code=stock_code, query_date=query_date, disk_cache_key=disk_cache_key)
                 raise
             except ApiClientError:
                 self.refresh_form_state()
@@ -549,10 +620,9 @@ class TWSEApiClient(BaseHttpClient):
             if any(keyword in short_name for keyword in EXCLUDED_SHORT_NAME_KEYWORDS):
                 continue
 
+            # 與 TPEX 一致：上市日期無法解析時仍保留該股（非回測不會用到此欄位，
+            # 回測則把 None 視為「日期未知、先保留」），避免默默縮小上市股票 universe。
             listed_date = parse_tdcc_or_twse_date(pick_first_present(row, TWSE_COMPANY_FIELD_ALIASES["listed_date"]))
-            if listed_date is None:
-                continue
-
             name = normalize_text(pick_first_present(row, TWSE_COMPANY_FIELD_ALIASES["stock_name"]))
             stocks[stock_code] = StockInfo(
                 code=stock_code,

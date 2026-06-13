@@ -46,6 +46,14 @@ class ShareholdingSnapshot:
 
         return {bucket.bucket_id: bucket for bucket in self.buckets}
 
+    def total_holder_count(self) -> int | None:
+        """回傳合計列的集保總戶數（找不到合計列時為 None）。"""
+
+        for bucket in self.buckets:
+            if bucket.is_total:
+                return bucket.holder_count
+        return None
+
 
 @dataclass(slots=True)
 class PriceBar:
@@ -74,6 +82,14 @@ class StockScreenResult:
     small_holder_trend: list[int | None] = field(default_factory=list)
     mid_holder_trend: list[int | None] = field(default_factory=list)
     large_holder_trend: list[int | None] = field(default_factory=list)
+    total_holder_trend: list[int | None] = field(default_factory=list)
+    latest_total_holders: int | None = None
+    early_total_holders: int | None = None
+    holder_change_ratio: float | None = None
+    large_holder_growth: float | None = None
+    passed_holder_decrease: bool = False
+    score: int | None = None
+    score_label: str = ""
     tdcc_dates: list[date] = field(default_factory=list)
     latest_tdcc_date: date | None = None
     tdcc_weeks_loaded: int = 0
