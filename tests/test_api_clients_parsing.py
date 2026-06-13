@@ -3,7 +3,9 @@ from datetime import date
 import pytest
 
 from api_clients import (
+    AccessBlockedError,
     ApiClientError,
+    BaseHttpClient,
     DataNotFoundError,
     TDCCOpenApiClient,
     TDCCPortalHistoryClient,
@@ -151,6 +153,37 @@ class _StubTPEX(TPEXApiClient):
 
     def get_json(self, url, **kwargs):
         return self._payload
+
+
+# --- WAF／安全頁（雲端 IP 被阻擋）偵測 ---
+
+class _FakeResponse:
+    def __init__(self, text, content_type="text/html; charset=UTF-8"):
+        self.headers = {"Content-Type": content_type}
+        self.text = text
+
+
+def _base_client():
+    return BaseHttpClient(http_settings=DEFAULT_HTTP_SETTINGS, cache_settings=DISABLED_CACHE, logger=None)
+
+
+def test_access_block_page_raises_access_blocked_error():
+    client = _base_client()
+    block_html = "<html><body>因為安全性考量，您所執行的頁面無法呈現。 FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED.</body></html>"
+    with pytest.raises(AccessBlockedError):
+        client._raise_if_access_blocked("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", _FakeResponse(block_html))
+
+
+def test_access_block_detection_ignores_json_and_clean_html():
+    client = _base_client()
+    # JSON 回應（content-type 非 html）不應誤判
+    client._raise_if_access_blocked("u", _FakeResponse("[]", content_type="application/json"))
+    # 一般 HTML（例如 TDCC 查詢頁）沒有封鎖字串也不應誤判
+    client._raise_if_access_blocked("u", _FakeResponse("<html><body>股權分散表</body></html>"))
+
+
+def test_access_blocked_error_is_api_client_error():
+    assert issubclass(AccessBlockedError, ApiClientError)
 
 
 def test_tpex_stock_day_parses_close_prices():

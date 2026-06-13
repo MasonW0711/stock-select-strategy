@@ -257,7 +257,16 @@ Streamlit 介面不再自動把 Excel 寫到伺服器磁碟，改以下載按鈕
 1. 第一次跑全市場太久
 
 - 可能原因：TDCC 歷史資料仍需逐檔逐週補抓
-- 建議做法：第一次先讓快取建立完成，之後重跑會明顯變快
+- 建議做法：第一次先讓快取建立完成，之後重跑會明顯變快；亦可調高 `--price-workers` 加速抓價
+
+1. 在 Streamlit Cloud 出現「官方資料站台拒絕請求」/log 顯示「FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED」
+
+- 可能原因：TWSE/TPEX/TDCC 的 WAF 阻擋了雲端／資料中心的出口 IP（回應為 HTTP 200 但內容是安全頁，不是 JSON）。這不是程式錯誤，重試同一 IP 也無效
+- 程式行為：偵測到安全頁會丟出 `AccessBlockedError`，UI／CLI 會顯示明確訊息而非崩潰
+- 建議做法：
+  1. 在本機執行（家用／公司 IP 通常可正常存取）
+  2. 於 Streamlit Cloud 設定 `HTTPS_PROXY`／`HTTP_PROXY` 環境變數，改由未被封鎖的出口 IP 連線（requests 會自動套用）
+  3. 或自行部署到出口 IP 未被封鎖的環境
 
 1. Excel 無法覆寫
 

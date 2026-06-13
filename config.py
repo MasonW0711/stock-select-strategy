@@ -19,6 +19,7 @@ TDCC_LATEST_SHAREHOLDING_URL = f"{TDCC_OPENAPI_BASE_URL}/opendata/1-5"
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, text/html, */*; q=0.01",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 

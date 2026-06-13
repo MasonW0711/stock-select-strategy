@@ -54,6 +54,18 @@ class DataNotFoundError(ApiClientError):
     """代表資料來源回應成功，但沒有找到目標資料。"""
 
 
+class AccessBlockedError(ApiClientError):
+    """官方站台以 WAF／安全頁（HTTP 200 但內容為封鎖訊息）拒絕請求。
+
+    常見於 Streamlit Cloud 等雲端/資料中心 IP 被 TWSE/TPEX/TDCC 阻擋；非程式錯誤，
+    且重試同一 IP 無效，故獨立成型別讓上層能給出明確、可行動的提示。
+    """
+
+
+# 官方安全頁的特徵字串（英文標記為 ASCII，編碼異常時仍可比對）。
+ACCESS_BLOCK_MARKERS = ("FOR SECURITY REASONS", "THIS PAGE CAN NOT BE ACCESSED", "因為安全性考量")
+
+
 class BaseHttpClient:
     """提供 requests.Session、retry 與簡單 rate limit 的基底 client。"""
 
@@ -110,9 +122,23 @@ class BaseHttpClient:
                 raise ApiClientError(f"請求失敗：{url} ({response.status_code})")
 
             response.encoding = response.apparent_encoding or response.encoding
+            self._raise_if_access_blocked(url, response)
             return response
 
         raise ApiClientError(f"請求失敗：{url}")
+
+    def _raise_if_access_blocked(self, url: str, response: requests.Response) -> None:
+        """偵測官方 WAF／安全頁（200 但內容為封鎖訊息）；命中即丟 AccessBlockedError，不重試。"""
+
+        content_type = normalize_text(response.headers.get("Content-Type")).lower()
+        if "html" not in content_type:
+            return
+        body_preview = response.text[:1000]
+        if any(marker in body_preview for marker in ACCESS_BLOCK_MARKERS):
+            self.logger.error("資料來源以安全頁拒絕此主機請求（疑似雲端/資料中心 IP 被阻擋）：%s", url)
+            raise AccessBlockedError(
+                f"官方資料站台以安全頁拒絕此主機的請求（很可能是雲端/資料中心 IP 被阻擋）：{url}"
+            )
 
     def _request_with_ssl_fallback(
         self,

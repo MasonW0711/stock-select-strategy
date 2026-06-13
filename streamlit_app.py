@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from api_clients import ApiClientError
+from api_clients import AccessBlockedError, ApiClientError
 from config import (
     DEFAULT_HTTP_SETTINGS,
     DEFAULT_MARKETS,
@@ -282,6 +282,15 @@ if submitted:
                 )
                 excel_bytes = frames_to_excel_bytes(frames)
                 download_name = resolve_output_path("").name
+        except AccessBlockedError:
+            st.session_state.pop("screening_run", None)
+            st.error("官方資料站台拒絕了這台伺服器的請求（很可能是雲端／資料中心 IP 被 TWSE／TPEX／TDCC 阻擋）。")
+            st.info(
+                "這不是程式錯誤，而是來源端的 IP 封鎖。可行做法：\n"
+                "1. 在本機執行（家用／公司 IP 通常正常）\n"
+                "2. 於 Streamlit Cloud 設定 `HTTPS_PROXY`／`HTTP_PROXY` 環境變數，改由未被封鎖的出口 IP 連線\n"
+                "3. 或自行部署到出口 IP 未被封鎖的環境"
+            )
         except ApiClientError as exc:
             st.session_state.pop("screening_run", None)
             st.error(f"官方資料來源暫時回應異常：{exc}")

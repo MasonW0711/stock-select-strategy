@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from api_clients import TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
+from api_clients import AccessBlockedError, ApiClientError, TDCCOpenApiClient, TDCCPortalHistoryClient, TPEXApiClient, TWSEApiClient
 from config import (
     DEFAULT_CACHE_SETTINGS,
     DEFAULT_HTTP_SETTINGS,
@@ -238,15 +238,24 @@ def main() -> int:
     cache_settings = build_cache_settings(args)
     start_date = parse_tdcc_or_twse_date(args.start_date) if args.start_date else None
 
-    _, summary, frames = execute_screening(
-        screen_parameters=screen_parameters,
-        logger=logger,
-        stock_limit=args.stock_limit,
-        markets=markets,
-        cache_settings=cache_settings,
-        start_date=start_date,
-        price_fetch_workers=max(args.price_workers, 1),
-    )
+    try:
+        _, summary, frames = execute_screening(
+            screen_parameters=screen_parameters,
+            logger=logger,
+            stock_limit=args.stock_limit,
+            markets=markets,
+            cache_settings=cache_settings,
+            start_date=start_date,
+            price_fetch_workers=max(args.price_workers, 1),
+        )
+    except AccessBlockedError as exc:
+        print(f"\n[錯誤] 官方資料站台拒絕此主機請求（很可能是雲端/資料中心 IP 被阻擋）：\n{exc}")
+        print("建議：改在本機執行，或設定 HTTPS_PROXY 環境變數改由未被封鎖的出口 IP 連線。")
+        return 2
+    except ApiClientError as exc:
+        print(f"\n[錯誤] 官方資料來源回應異常，已中止：{exc}")
+        print("建議：稍後重試，或先用 --stock-limit 縮小範圍觀察 --log-level DEBUG。")
+        return 1
     print_terminal_output(frames=frames, summary_text=build_summary_text(summary))
 
     output_path = resolve_output_path(args.output)
